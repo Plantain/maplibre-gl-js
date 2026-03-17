@@ -784,15 +784,21 @@ export function isImageBitmap(image: any): image is ImageBitmap {
  * @param data - Data to convert
  * @returns - A  promise resolved when the conversion is finished
  */
-export const arrayBufferToImageBitmap = async (data: ArrayBuffer, options?: ImageBitmapOptions): Promise<ImageBitmap> => {
+export const arrayBufferToImageBitmap = async (
+    data: ArrayBuffer,
+    options?: ImageBitmapOptions,
+    contentType?: string | null
+): Promise<ImageBitmap> => {
     if (data.byteLength === 0) {
         return createImageBitmap(new ImageData(1, 1), options);
     }
-    const blob: Blob = new Blob([new Uint8Array(data)], {type: 'image/png'});
+    const blob: Blob = new Blob([new Uint8Array(data)], {
+        type: contentType ?? undefined
+    });
     try {
         return createImageBitmap(blob, options);
     } catch (e) {
-        throw new Error(`Could not load image because of ${ensureError(e).message}. Please make sure to use a supported image type such as PNG or JPEG. Note that SVGs are not supported.`);
+        throw new Error(`Could not load image because of ${ensureError(e).message}. Please make sure to use a supported image type such as PNG, JPEG, or WebP. Note that SVGs are not supported.`);
     }
 };
 
@@ -808,7 +814,10 @@ const transparentPngUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAA
  * @param data - Data to convert
  * @returns - A promise resolved when the conversion is finished
  */
-export const arrayBufferToImage = (data: ArrayBuffer): Promise<HTMLImageElement> => {
+export const arrayBufferToImage = (
+    data: ArrayBuffer,
+    contentType?: string | null
+): Promise<HTMLImageElement> => {
     return new Promise((resolve, reject) => {
         const img: HTMLImageElement = new Image();
         img.onload = () => {
@@ -820,8 +829,10 @@ export const arrayBufferToImage = (data: ArrayBuffer): Promise<HTMLImageElement>
             img.onload = null;
             window.requestAnimationFrame(() => img.src = transparentPngUrl);
         };
-        img.onerror = () => reject(new Error('Could not load image. Please make sure to use a supported image type such as PNG or JPEG. Note that SVGs are not supported.'));
-        const blob: Blob = new Blob([new Uint8Array(data)], {type: 'image/png'});
+        img.onerror = () => reject(new Error('Could not load image. Please make sure to use a supported image type such as PNG, JPEG, or WebP. Note that SVGs are not supported.'));
+        const blob: Blob = new Blob([new Uint8Array(data)], {
+            type: contentType ?? undefined
+        });
         img.src = data.byteLength ? URL.createObjectURL(blob) : transparentPngUrl;
     });
 };

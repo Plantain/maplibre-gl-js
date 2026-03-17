@@ -5,6 +5,7 @@ import {fakeServer, type FakeServer} from 'nise';
 import {ImageRequest} from './image_request';
 import {isAbortError} from './abort_error';
 import * as ajax from './ajax';
+import * as util from './util';
 
 describe('ImageRequest', () => {
     let server: FakeServer;
@@ -111,35 +112,59 @@ describe('ImageRequest', () => {
     });
 
     test('getImage uses createImageBitmap when supported', async () => {
-        server.respondWith(request => { request.respond(200, {'Content-Type': 'image/png',
+        server.respondWith(request => request.respond(200, {'Content-Type': 'image/png',
             'Cache-Control': 'cache',
-            'Expires': 'expires'}, ''); });
+            'Expires': 'expires'}, '0'));
 
-        stubAjaxGetImage(() => Promise.resolve(new ImageBitmap()));
+        const imageBitmap = {} as ImageBitmap;
+        stubAjaxGetImage(() => Promise.resolve(imageBitmap));
         const promise = ImageRequest.getImage({url: ''}, new AbortController());
         server.respond();
 
         const response = await promise;
 
-        expect(response.data).toBeInstanceOf(ImageBitmap);
+        expect(response.data).toBe(imageBitmap);
         expect(response.cacheControl).toBe('cache');
         expect(response.expires).toBe('expires');
+        expect(response.contentType).toBe('image/png');
     });
 
-    test('getImage passes imageBitmapOptions to createImageBitmap', async () => {
-        server.respondWith(request => request.respond(200, {'Content-Type': 'image/png',
+    test('getImage uses createImageBitmap when premultiplyAlpha none is requested and supported', async () => {
+        server.respondWith(request => request.respond(200, {'Content-Type': 'image/webp',
             'Cache-Control': 'cache',
             'Expires': 'expires'}, '0'));
 
-        const createImageBitmapSpy = vi.fn().mockResolvedValue({} as ImageBitmap);
+        const imageBitmap = {} as ImageBitmap;
+        const createImageBitmapSpy = vi.fn().mockResolvedValue(imageBitmap);
         stubAjaxGetImage(createImageBitmapSpy);
 
         const options = {premultiplyAlpha: 'none'} as const;
         const promise = ImageRequest.getImage({url: ''}, new AbortController(), true, options);
         server.respond();
 
-        await expect(promise).resolves.toBeDefined();
-        expect(createImageBitmapSpy).toHaveBeenCalledWith(expect.any(Blob), options);
+        const response = await promise;
+        expect(response.data).toBe(imageBitmap);
+        expect(createImageBitmapSpy).toHaveBeenCalled();
+    });
+
+    test('getImage uses HTMLImageElement on Safari when premultiplyAlpha none is requested', async () => {
+        server.respondWith(request => request.respond(200, {'Content-Type': 'image/webp',
+            'Cache-Control': 'cache',
+            'Expires': 'expires'}, '0'));
+
+        const createImageBitmapSpy = vi.fn().mockResolvedValue({} as ImageBitmap);
+        stubAjaxGetImage(createImageBitmapSpy);
+        const isSafariSpy = vi.spyOn(util, 'isSafari').mockReturnValue(true);
+
+        const options = {premultiplyAlpha: 'none'} as const;
+        const promise = ImageRequest.getImage({url: ''}, new AbortController(), true, options);
+        server.respond();
+
+        const response = await promise;
+        expect(response.data).toBeInstanceOf(HTMLImageElement);
+        expect(createImageBitmapSpy).not.toHaveBeenCalled();
+
+        isSafariSpy.mockRestore();
     });
 
     test('getImage using createImageBitmap throws exception', async () => {
@@ -223,6 +248,7 @@ describe('ImageRequest', () => {
     test('getImage uses makeRequest when imageBitmapOptions are set', async () => {
         const makeRequestSky = vi.spyOn(ajax, 'makeRequest');
         server.respondWith(request => request.respond(200, {'Content-Type': 'image/png'}, '0'));
+        stubAjaxGetImage(vi.fn().mockResolvedValue({} as ImageBitmap));
 
         const promise = ImageRequest.getImage({url: ''}, new AbortController(), false, {premultiplyAlpha: 'none'});
 

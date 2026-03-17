@@ -2728,7 +2728,7 @@ export class Map extends Camera {
      * const response = await map.loadImage('https://picsum.photos/50/50');
      * // Add the loaded image to the style's sprite with the ID 'photo'.
      * map.addImage('photo', response.data);
-     * ```
+    * ```
      * @see [Add an icon to the map](https://maplibre.org/maplibre-gl-js/docs/examples/add-an-icon-to-the-map/)
      */
     async loadImage(url: string): Promise<GetResourceResponse<HTMLImageElement | ImageBitmap>> {

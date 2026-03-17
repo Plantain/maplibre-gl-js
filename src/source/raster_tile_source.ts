@@ -188,7 +188,9 @@ export class RasterTileSource extends Evented implements Source {
     async loadTile(tile: Tile): Promise<void> {
         const url = tile.tileID.canonical.url(this.tiles, this.map.getPixelRatio(), this.scheme);
         const premultiply = this._options.premultiply !== false;
-        const imageBitmapOptions = premultiply ? undefined : {premultiplyAlpha: 'none'} as const;
+        const imageBitmapOptions = premultiply
+            ? undefined
+            : {premultiplyAlpha: 'none', colorSpaceConversion: 'none'} as const;
         tile.abortController = new AbortController();
         try {
             const response = await ImageRequest.getImage(

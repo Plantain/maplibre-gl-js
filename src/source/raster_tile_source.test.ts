@@ -307,7 +307,7 @@ describe('RasterTileSource', () => {
                 expect.anything(),
                 expect.any(AbortController),
                 false,
-                {premultiplyAlpha: 'none'}
+                {premultiplyAlpha: 'none', colorSpaceConversion: 'none'}
             );
             expect(update).toHaveBeenCalledWith(image, {useMipmap: true, premultiply: false});
             expect(tile.state).toBe('loaded');
