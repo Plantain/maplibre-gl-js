@@ -14,6 +14,6 @@ export interface WorkerGlobalScopeInterface {
 }
 
 export function workerFactory() {
-    const isModuleWorker = config.WORKER_URL.startsWith('blob:') || config.WORKER_URL.includes('type=module');
+    const isModuleWorker = config.WORKER_URL.includes('type=module');
     return new Worker(config.WORKER_URL, isModuleWorker ? {type: 'module'} : undefined);
 }
