@@ -16,7 +16,8 @@ for (const file of manifest.files) {
     const references = [...content.toString().matchAll(/(?:from|import)\s*["']\.\/([^"']+)["']/g)].map(match => match[1]);
     for (const reference of references) assert.ok(manifest.files.includes(reference), `Missing module: ${reference}`);
     const map = JSON.parse(await readFile(path.join(directory, `${file}.map`)));
-    assert.ok(!map.sources.some(source => /globe_transform|vertical_perspective_transform|heatmap_bucket|fill_extrusion_bucket|fullscreen_control|globe_control|terrain_control/.test(source)), 'Excluded modules reached the bundle');
+    assert.ok(!map.sources.some(source => /globe_transform|vertical_perspective_transform|heatmap_bucket|fill_extrusion_bucket|fullscreen_control|globe_control|terrain_control|geojson-vt\/dist\//.test(source)), 'Excluded modules reached the bundle');
+    assert.ok(!map.sources.some(source => /geojson-vt\/node_modules\/kdbush/.test(source)), 'The tiler bundled a duplicate spatial index');
     sizes.push({file, bytes: content.length, gzip: gzipSync(content).length, brotli: brotliCompressSync(content, {params: {[constants.BROTLI_PARAM_QUALITY]: 11}}).length});
 }
 const main = await readFile(path.join(directory, manifest.main), 'utf8');
@@ -63,23 +64,48 @@ try {
             if (!dataLayer.mapLibreRasterSupportsPremultiplyOption(lib)) throw new Error('Forecast data layer does not recognize raw raster support');
         }
         const mapErrors = [];
+        const excluded = [];
         const map = new lib.Map({container: 'map', center: [73, 36], zoom: 5.99, canvasContextAttributes: {preserveDrawingBuffer: true}, style: {
             version: 8,
             glyphs: `${location.origin}/test/integration/assets/glyphs/{fontstack}/{range}.pbf`,
             sources: {mlt: {type: 'vector', encoding: 'mlt', tiles: [`${location.origin}/test/integration/assets/tiles/mlt/5/22/12.mlt`], minzoom: 5, maxzoom: 5}},
             layers: [{id: 'land', type: 'fill', source: 'mlt', 'source-layer': 'landcover', paint: {'fill-color': '#008000'}}]
         }});
-        map.on('error', event => mapErrors.push(event.error.message));
+        map.on('error', event => {
+            const message = event.error.message;
+            if (message.includes('not included in the SkySight renderer')) excluded.push(message);
+            else mapErrors.push(message);
+        });
         await map.once('idle');
         const features = map.queryRenderedFeatures().length;
         if (!features) throw new Error('MLT worker did not render features');
-        map.addSource('geojson', {type: 'geojson', data: {type: 'Feature', properties: {}, geometry: {type: 'Point', coordinates: [73, 36]}}});
+        map.addSource('geojson', {type: 'geojson', data: {type: 'Feature', id: 1, properties: {}, geometry: {type: 'Point', coordinates: [73, 36]}}});
         map.addLayer({id: 'point', type: 'circle', source: 'geojson', paint: {'circle-radius': 10, 'circle-color': '#ff0000'}});
         await map.once('idle');
         if (!map.queryRenderedFeatures({layers: ['point']}).length) throw new Error('GeoJSON worker failed');
         map.addLayer({id: 'label', type: 'symbol', source: 'geojson', layout: {'text-field': 'SkySight', 'text-font': ['Noto Sans Regular']}});
         await map.once('idle');
         if (!map.queryRenderedFeatures({layers: ['label']}).length) throw new Error('Labels did not render');
+        const geojson = map.getSource('geojson');
+        await geojson.setData({type: 'Feature', id: 1, properties: {stage: 'replaced'}, geometry: {type: 'Point', coordinates: [73.1, 36]}});
+        await map.once('idle');
+        if (!map.queryRenderedFeatures({layers: ['point']}).some(feature => feature.properties.stage === 'replaced')) throw new Error('GeoJSON setData failed');
+        await geojson.updateData({update: [{id: 1, newGeometry: {type: 'Point', coordinates: [73, 36]}, addOrUpdateProperties: [{key: 'stage', value: 'updated'}]}]});
+        await map.once('idle');
+        if (!map.queryRenderedFeatures({layers: ['point']}).some(feature => feature.properties.stage === 'updated')) throw new Error('GeoJSON updateData failed');
+        if (!map.querySourceFeatures('geojson').some(feature => feature.properties.stage === 'updated')) throw new Error('GeoJSON source query failed');
+
+        const polygon = {type: 'Polygon', coordinates: [
+            [[72, 35], [74, 35], [74, 37], [72, 37], [72, 35]],
+            [[72.8, 35.8], [72.8, 36.2], [73.2, 36.2], [73.2, 35.8], [72.8, 35.8]]
+        ]};
+        map.addSource('polygon', {type: 'geojson', data: {type: 'Feature', properties: {}, geometry: polygon}});
+        map.addLayer({id: 'polygon', type: 'fill', source: 'polygon'});
+        await map.once('idle');
+        if (!map.queryRenderedFeatures(map.project([73.5, 36]), {layers: ['polygon']}).length) throw new Error('GeoJSON polygon did not render');
+        if (map.queryRenderedFeatures(map.project([73, 36]), {layers: ['polygon']}).length) throw new Error('GeoJSON polygon hole was filled');
+        map.removeLayer('polygon');
+        map.removeSource('polygon');
 
         const canvas = document.createElement('canvas');
         canvas.width = canvas.height = 256;
@@ -109,18 +135,28 @@ try {
         await map.once('idle');
         if (!customFrames) throw new Error('Custom layer did not render');
         map.setTerrain(null);
-        const excluded = [];
         for (const type of ['heatmap', 'fill-extrusion']) {
             try { map.addLayer({id: `excluded-${type}`, type, source: 'geojson'}); }
             catch (error) { excluded.push(error.message); }
         }
         try { map.setProjection({type: 'globe'}); } catch (error) { excluded.push(error.message); }
+        try { map.setFontFaces({'Noto Sans Regular': [{url: '/unused.woff2'}]}); } catch (error) { excluded.push(error.message); }
+        map.setFontFaces(null);
+        map.addLayer({id: 'excluded-distance', type: 'circle', source: 'geojson', paint: {'circle-radius': ['distance', {type: 'Point', coordinates: [73, 36]}]}});
+        map.addLayer({id: 'excluded-within', type: 'circle', source: 'geojson', filter: ['within', polygon]});
+        const clusterError = map.once('error');
+        map.addSource('excluded-cluster', {type: 'geojson', cluster: true, data: {type: 'FeatureCollection', features: []}});
+        await clusterError;
+        map.removeSource('excluded-cluster');
         map.remove();
         return {version: lib.getVersion(), worker: lib.getWorkerUrl(), features, customFrames, mapErrors, excluded};
     }, {manifest, moduleUrl: process.env.MAPLIBRE_MODULE_URL, dataLayerUrl: process.env.MAPLIBRE_DATA_LAYER_URL});
     assert.deepEqual(errors, []);
     assert.deepEqual(result.mapErrors, []);
-    assert.equal(result.excluded.length, 3);
+    assert.equal(result.excluded.length, 7);
+    for (const feature of ['Heatmaps', 'Fill extrusions', 'Only Mercator', 'Font faces', 'Distance expressions', 'Within expressions', 'GeoJSON clustering']) {
+        assert.ok(result.excluded.some(message => message.includes(feature)), `Missing exclusion error: ${feature}`);
+    }
     assert.ok(result.worker.endsWith(manifest.worker));
     console.log(JSON.stringify({result, sizes, total: sizes.reduce((total, item) => ({bytes: total.bytes + item.bytes, gzip: total.gzip + item.gzip, brotli: total.brotli + item.brotli}), {bytes: 0, gzip: 0, brotli: 0})}, null, 2));
 } finally {
