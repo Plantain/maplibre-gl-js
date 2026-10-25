@@ -28,16 +28,19 @@ export type LoadVectorTileResult = {
     encoding?: TileEncoding;
 };
 
-/**
- * Uses an explicit tile MIME type when available. For MLT-enabled sources with generic binary
- * responses, recognizes MLT's length-prefixed blocks and supported tags (1 and 2); other payloads
- * use the MVT decoder. Empty responses retain the requested encoding and decode as empty tiles.
- */
-function responseEncoding(rawData: ArrayBuffer, preferred: TileEncoding = 'mvt', contentType?: string | null): TileEncoding {
+/** Returns the encoding declared by a tile MIME type; generic binary responses have no declared encoding. */
+function responseEncoding(contentType?: string | null): TileEncoding | undefined {
     const mime = contentType?.split(';', 1)[0].trim().toLowerCase();
     if (mime === 'application/vnd.maplibre-tile') return 'mlt';
     if (['application/vnd.mapbox-vector-tile', 'application/x-protobuf', 'application/protobuf', 'application/vnd.google.protobuf', 'application/pbf'].includes(mime)) return 'mvt';
-    if (preferred !== 'mlt' || !rawData.byteLength) return preferred;
+}
+
+/**
+ * Checks MLT's block framing as a decoder hint. MVT bytes can also match this framing,
+ * so generic responses must fall back to MVT if MLT decoding fails. Empty tiles match both formats.
+ */
+function hasMLTFraming(rawData: ArrayBuffer): boolean {
+    if (!rawData.byteLength) return true;
 
     const reader = new PbfReader(rawData);
     let hasLayer = false;
@@ -45,16 +48,25 @@ function responseEncoding(rawData: ArrayBuffer, preferred: TileEncoding = 'mvt',
         while (reader.pos < reader.length) {
             const length = reader.readVarint();
             const end = reader.pos + length;
-            if (!length || end > reader.length) return 'mvt';
+            if (!length || end > reader.length) return false;
             const tag = reader.readVarint();
-            if (reader.pos > end) return 'mvt';
+            if (reader.pos > end) return false;
             hasLayer ||= tag === 1 || tag === 2;
             reader.pos = end;
         }
     } catch {
-        return 'mvt';
+        return false;
     }
-    return hasLayer ? 'mlt' : 'mvt';
+    return hasLayer;
+}
+
+/** Decodes ambiguous MLT-framed responses with an MVT retry using the same downloaded bytes. */
+function decodeNegotiatedTile(rawData: ArrayBuffer): LoadVectorTileResult {
+    try {
+        return {vectorTile: new MLTVectorTile(rawData), rawData, encoding: 'mlt'};
+    } catch {
+        return {vectorTile: new VectorTile(new PbfReader(rawData)), rawData, encoding: 'mvt'};
+    }
 }
 
 /**
@@ -81,7 +93,11 @@ export class VectorTileWorkerSource implements WorkerSource {
      */
     loadVectorTile(params: WorkerTileParameters, rawData: ArrayBuffer, contentType?: string | null): LoadVectorTileResult {
         try {
-            const encoding = responseEncoding(rawData, params.encoding, contentType);
+            const declaredEncoding = responseEncoding(contentType);
+            if (!declaredEncoding && params.encoding === 'mlt' && hasMLTFraming(rawData)) {
+                return decodeNegotiatedTile(rawData);
+            }
+            const encoding = declaredEncoding ?? 'mvt';
             const vectorTile = encoding !== 'mlt'
                 ? new VectorTile(new PbfReader(rawData))
                 : new MLTVectorTile(rawData);

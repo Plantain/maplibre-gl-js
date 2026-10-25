@@ -2,6 +2,7 @@ import {afterEach, beforeEach, expect, test} from 'vitest';
 import {readFileSync} from 'node:fs';
 import path from 'node:path';
 import {fakeServer, type FakeServer} from 'nise';
+import {fromVectorTileJs, GeoJSONWrapper, type Feature, type VectorTileLayerLike} from '@maplibre/vt-pbf';
 import {VectorTileWorkerSource} from './vector_tile_worker_source.ts';
 import {StyleLayerIndex} from '../style/style_layer_index.ts';
 import {SubdivisionGranularitySetting} from '../render/subdivision_granularity_settings.ts';
@@ -38,6 +39,12 @@ function tileParams(): WorkerTileParameters {
         promoteId: undefined, showCollisionBoxes: false,
         subdivisionGranularity: SubdivisionGranularitySetting.noSubdivision
     };
+}
+
+function pointLayer(name: string, features: Feature[]): VectorTileLayerLike {
+    const layer = new GeoJSONWrapper(features, {version: 2, extent: 4096});
+    layer.name = name;
+    return layer;
 }
 
 test.each([
@@ -94,6 +101,39 @@ test('overzoomed MVT fallback is reported and queried as MVT', async () => {
     result.featureIndex.encoding = result.encoding;
     result.featureIndex.rawTileData = result.rawTileData;
     expect(result.featureIndex.loadVTLayers().water.length).toBeGreaterThan(0);
+});
+
+test('retries MVT when generic response bytes resemble MLT framing', async () => {
+    const rawData = Uint8Array.from(fromVectorTileJs({layers: {
+        aaaa: pointLayer('aaaa', [
+            {type: 1, geometry: [[5839, 5602]], tags: {idx: 53, name: 'a'.repeat(16)}, id: 7859},
+            {type: 1, geometry: [[9782, 10269]], tags: {idx: 56, name: 'a'.repeat(49)}, id: 5386}
+        ]),
+        aaaaa: pointLayer('aaaaa', [
+            {type: 1, geometry: [[5499, 3230]], tags: {idx: 97, name: 'a'.repeat(8)}, id: 6815}
+        ])
+    }})).buffer;
+    server.respondWith(request => request.respond(200, {'Content-Type': 'binary/octet-stream'}, rawData as any));
+    const source = createSource();
+    const params = tileParams();
+    const pending = source.loadTile(params);
+    server.respond();
+    const result = await pending as WorkerTileWithData;
+    expect(result.encoding).toBe('mvt');
+    expect(result.rawTileData).toEqual(rawData);
+    expect(server.requests).toHaveLength(1);
+
+    const tile = new Tile(params.tileID, 512);
+    const worldCoordinateHelper = new MercatorProjection().worldCoordinateHelper;
+    for (const data of [result, await source.reloadTile(params)]) {
+        tile.loadVectorData(data, null);
+        const features = [];
+        tile.querySourceFeatures(features, {sourceLayer: 'aaaa', worldCoordinateHelper});
+        expect(features.map(feature => feature.properties.idx)).toEqual([53, 56]);
+        const otherFeatures = [];
+        tile.querySourceFeatures(otherFeatures, {sourceLayer: 'aaaaa', worldCoordinateHelper});
+        expect(otherFeatures.map(feature => feature.properties.idx)).toEqual([97]);
+    }
 });
 
 test('honors explicit MIME types and rejects corrupt or still-compressed tiles', () => {
