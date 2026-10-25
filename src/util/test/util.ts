@@ -1,3 +1,4 @@
+import * as jxlSupport from '../jxl_supported.ts';
 import {vi, expect, onTestFinished, type Mock} from 'vitest';
 import {Map, type MapOptions} from '../../ui/map.ts';
 import {NullWebGL2RenderingContext, createNullGL} from './null_gl.ts';
@@ -176,6 +177,7 @@ export function getMockDispatcher(): Dispatcher {
 }
 
 export function stubAjaxGetImage(createImageBitmap: typeof global.createImageBitmap): void {
+    vi.spyOn(jxlSupport, 'isJXLSupported').mockReturnValue(false);
     global.createImageBitmap = createImageBitmap;
 
     global.URL.revokeObjectURL = () => {};

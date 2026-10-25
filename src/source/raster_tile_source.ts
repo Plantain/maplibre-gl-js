@@ -1,5 +1,5 @@
 import {ensureError, extend, pick} from '../util/util.ts';
-import {ImageRequest} from '../util/image_request.ts';
+import {ImageRequest, type ImageRequestPriority, type ImageRequestSchedulingOptions} from '../util/image_request.ts';
 import {ResourceType} from '../util/request_manager.ts';
 import {ErrorEvent, Evented} from '../util/evented.ts';
 import {MapSourceDataEvent, type SourceEventType} from '../ui/events.ts';
@@ -67,7 +67,12 @@ export class RasterTileSource extends Evented<SourceEventType> implements Source
     tiles: string[];
 
     _loaded: boolean;
-    _options: RasterSourceSpecification | RasterDEMSourceSpecification;
+    _options: (RasterSourceSpecification | RasterDEMSourceSpecification) & {premultiply?: boolean};
+    _requestPriority: ImageRequestPriority = 'normal';
+    _imageRequestScheduling: ImageRequestSchedulingOptions = {
+        getPriority: () => this._requestPriority,
+        isPaused: () => this.map?.isMoving() ?? false
+    };
     _premultiplyAlpha: boolean;
     _tileJSONRequest: AbortController;
 
@@ -87,6 +92,7 @@ export class RasterTileSource extends Evented<SourceEventType> implements Source
         this._premultiplyAlpha = true;
 
         this._options = extend({type: 'raster'}, options);
+        this._premultiplyAlpha = this._options.premultiply !== false;
         extend(this, pick(options, ['url', 'scheme', 'tileSize']));
     }
 
@@ -202,10 +208,31 @@ export class RasterTileSource extends Evented<SourceEventType> implements Source
         return !this.tileBounds || this.tileBounds.contains(tileID.canonical);
     }
 
+    /**
+     * Prioritize displayed tiles over speculative preloads. Preloads share a
+     * two-request limit and pause while this map is moving. Changes also apply
+     * to requests already queued, without discarding downloaded tile data.
+     */
+    setRequestPriority(priority: ImageRequestPriority): this {
+        if (priority !== 'normal' && priority !== 'preload') {
+            throw new Error(`Invalid raster request priority: ${priority}`);
+        }
+        if (this._requestPriority !== priority) {
+            this._requestPriority = priority;
+            ImageRequest.processQueue();
+        }
+        return this;
+    }
+
+    /** Returns whether this source supplies displayed tiles or speculative forecast preloads. */
+    getRequestPriority(): ImageRequestPriority {
+        return this._requestPriority;
+    }
+
     async loadTile(tile: Tile): Promise<void> {
         const url = tile.tileID.canonical.url(this.tiles, this.map.getPixelRatio(), this.scheme, this.map.style.projection.worldCoordinateHelper.tileMatrixSet);
         const premultiply = this._premultiplyAlpha;
-        const imageBitmapOptions = premultiply ? undefined : {premultiplyAlpha: 'none'} as const;
+        const imageBitmapOptions = premultiply ? undefined : {premultiplyAlpha: 'none', colorSpaceConversion: 'none'} as const;
         tile.abortController = new AbortController();
         try {
             const response = await ImageRequest.transformAndGetImage(
@@ -214,7 +241,8 @@ export class RasterTileSource extends Evented<SourceEventType> implements Source
                 ResourceType.Tile,
                 tile.abortController,
                 this.map._refreshExpiredTiles,
-                imageBitmapOptions
+                imageBitmapOptions,
+                this._imageRequestScheduling
             );
             delete tile.abortController;
             if (tile.aborted) {

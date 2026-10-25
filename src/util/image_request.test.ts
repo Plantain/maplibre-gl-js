@@ -1,10 +1,22 @@
-import {describe, beforeEach, afterEach, test, expect, vi} from 'vitest';
+import {describe, beforeEach, afterEach, onTestFinished, test, expect, vi} from 'vitest';
 import {config} from './config.ts';
 import {sleep, stubAjaxGetImage} from './test/util.ts';
 import {fakeServer, type FakeServer} from 'nise';
-import {ImageRequest} from './image_request.ts';
+import {ImageRequest, type ImageRequestSchedulingOptions} from './image_request.ts';
 import {isAbortError} from './abort_error.ts';
 import * as ajax from './ajax.ts';
+import * as util from './util.ts';
+import * as jxlSupport from './jxl_supported.ts';
+import {addProtocol, removeProtocol} from '../source/protocol_crud.ts';
+
+/** Mock fetch and expose the prototype signal that ajax.ts uses to detect fetch support in jsdom. */
+function mockFetch() {
+    if (!Object.hasOwn(Request.prototype, 'signal')) {
+        Object.defineProperty(Request.prototype, 'signal', {value: undefined, configurable: true});
+        onTestFinished(() => { Reflect.deleteProperty(Request.prototype, 'signal'); });
+    }
+    global.fetch = vi.fn().mockResolvedValue(new Response(new ArrayBuffer(0)));
+}
 
 describe('ImageRequest', () => {
     let server: FakeServer;
@@ -16,6 +28,7 @@ describe('ImageRequest', () => {
     });
     afterEach(() => {
         server.restore();
+        vi.restoreAllMocks();
     });
 
     test('getImage respects maxParallelImageRequests', async () => {
@@ -36,6 +49,168 @@ describe('ImageRequest', () => {
         server.requests[1].respond(200);
         await promises[1];
         expect(server.requests).toHaveLength(maxRequests + 2);
+    });
+
+    test('current images overtake queued preloads while preserving FIFO within each priority', async () => {
+        const preload: ImageRequestSchedulingOptions = {getPriority: () => 'preload'};
+        for (let i = 0; i < config.MAX_PARALLEL_IMAGE_REQUESTS; i++) {
+            ImageRequest.getImage({url: `active-${i}`}, new AbortController()).catch(() => {});
+        }
+        const pending = [
+            ImageRequest.getImage({url: 'preload-1'}, new AbortController(), true, undefined, preload),
+            ImageRequest.getImage({url: 'preload-2'}, new AbortController(), true, undefined, preload),
+            ImageRequest.getImage({url: 'current-1'}, new AbortController()),
+            ImageRequest.getImage({url: 'current-2'}, new AbortController())
+        ];
+
+        for (let i = 0; i < 4; i++) {
+            server.requests[i].respond(200);
+            await sleep(0);
+        }
+        expect(server.requests.slice(config.MAX_PARALLEL_IMAGE_REQUESTS).map(request => request.url))
+            .toEqual(['current-1', 'current-2', 'preload-1', 'preload-2']);
+        for (const request of server.requests.slice(config.MAX_PARALLEL_IMAGE_REQUESTS)) request.respond(200);
+        await Promise.all(pending);
+    });
+
+    test('preloads use at most two slots and current images can use the remaining capacity', async () => {
+        const preload: ImageRequestSchedulingOptions = {getPriority: () => 'preload'};
+        const pending = [];
+        for (let i = 0; i < 5; i++) {
+            pending.push(ImageRequest.getImage({url: `preload-${i}`}, new AbortController(), true, undefined, preload));
+        }
+        expect(server.requests).toHaveLength(2);
+        for (let i = 0; i < config.MAX_PARALLEL_IMAGE_REQUESTS; i++) {
+            pending.push(ImageRequest.getImage({url: `current-${i}`}, new AbortController()));
+        }
+        expect(server.requests).toHaveLength(config.MAX_PARALLEL_IMAGE_REQUESTS);
+        server.requests[0].respond(200);
+        await sleep(0);
+        expect(server.requests.at(-1).url).toBe(`current-${config.MAX_PARALLEL_IMAGE_REQUESTS - 2}`);
+        server.requests[1].respond(200);
+        await sleep(0);
+        expect(server.requests.at(-1).url).toBe(`current-${config.MAX_PARALLEL_IMAGE_REQUESTS - 1}`);
+        // Drain both priorities, including preloads started by completions.
+        for (let i = 2; i < pending.length; i++) {
+            server.requests[i].respond(200);
+            await sleep(0);
+        }
+        await Promise.all(pending);
+    });
+
+    test('promoting a source immediately updates queued and running requests without refetching', async () => {
+        let priority: 'normal' | 'preload' = 'preload';
+        const scheduling: ImageRequestSchedulingOptions = {getPriority: () => priority};
+        const pending = [];
+        for (let i = 0; i < 5; i++) {
+            pending.push(ImageRequest.getImage({url: `selected-${i}`}, new AbortController(), true, undefined, scheduling));
+        }
+        expect(server.requests).toHaveLength(2);
+        priority = 'normal';
+        ImageRequest.processQueue();
+        expect(server.requests.map(request => request.url)).toEqual([
+            'selected-0', 'selected-1', 'selected-2', 'selected-3', 'selected-4'
+        ]);
+
+        // Promoted in-flight requests no longer consume the preload allowance.
+        const next = {getPriority: () => 'preload' as const};
+        pending.push(ImageRequest.getImage({url: 'next-0'}, new AbortController(), true, undefined, next));
+        pending.push(ImageRequest.getImage({url: 'next-1'}, new AbortController(), true, undefined, next));
+        expect(server.requests).toHaveLength(7);
+        for (const request of server.requests) request.respond(200);
+        await Promise.all(pending);
+    });
+
+    test('paused preloads do not occupy slots or block current images and resume when reconsidered', async () => {
+        let moving = true;
+        const scheduling: ImageRequestSchedulingOptions = {
+            getPriority: () => 'preload',
+            isPaused: () => moving
+        };
+        const preload = ImageRequest.getImage({url: 'next'}, new AbortController(), true, undefined, scheduling);
+        const current = ImageRequest.getImage({url: 'current'}, new AbortController());
+        expect(server.requests.map(request => request.url)).toEqual(['current']);
+        server.requests[0].respond(200);
+        await current;
+        expect(server.requests).toHaveLength(1);
+        moving = false;
+        ImageRequest.processQueue();
+        expect(server.requests.map(request => request.url)).toEqual(['current', 'next']);
+        server.requests[1].respond(200);
+        await preload;
+    });
+
+    test('cancelled paused preloads settle immediately and are never dispatched', async () => {
+        const controller = new AbortController();
+        const scheduling: ImageRequestSchedulingOptions = {getPriority: () => 'preload', isPaused: () => true};
+        const pending = ImageRequest.getImage({url: 'obsolete'}, controller, true, undefined, scheduling);
+        const rejected = pending.catch(error => error);
+        controller.abort();
+        expect(isAbortError(await rejected)).toBe(true);
+        ImageRequest.processQueue();
+        expect(server.requests).toHaveLength(0);
+    });
+
+    test('already aborted requests reject without entering the queue', async () => {
+        const controller = new AbortController();
+        controller.abort();
+        await expect(ImageRequest.getImage({url: 'obsolete'}, controller)).rejects.toSatisfy(isAbortError);
+        expect(server.requests).toHaveLength(0);
+    });
+
+    test('preload completions and failures release capacity for subsequent preloads', async () => {
+        const scheduling: ImageRequestSchedulingOptions = {getPriority: () => 'preload'};
+        const pending = ['next-0', 'next-1', 'next-2', 'next-3'].map(url =>
+            ImageRequest.getImage({url}, new AbortController(), true, undefined, scheduling).catch(() => null));
+        expect(server.requests).toHaveLength(2);
+        server.requests[0].respond(404);
+        await pending[0];
+        expect(server.requests).toHaveLength(3);
+        server.requests[1].respond(200);
+        await pending[1];
+        expect(server.requests).toHaveLength(4);
+        for (const request of server.requests.slice(2)) request.respond(200);
+        await Promise.all(pending);
+    });
+
+    test('getImage uses createImageBitmap when premultiplyAlpha none is requested and supported', async () => {
+        server.respondWith(request => request.respond(200, {'Content-Type': 'image/webp',
+            'Cache-Control': 'cache',
+            'Expires': 'expires'}, '0'));
+
+        const imageBitmap = {} as ImageBitmap;
+        const createImageBitmapSpy = vi.fn().mockResolvedValue(imageBitmap);
+        stubAjaxGetImage(createImageBitmapSpy);
+
+        const options = {premultiplyAlpha: 'none'} as const;
+        const promise = ImageRequest.getImage({url: ''}, new AbortController(), true, options);
+        server.respond();
+
+        const response = await promise;
+        expect(response.data).toBe(imageBitmap);
+        expect(createImageBitmapSpy).toHaveBeenCalled();
+        expect(jxlSupport.isJXLSupported).toHaveBeenCalledWith(true);
+    });
+
+    test('getImage uses HTMLImageElement on Safari when premultiplyAlpha none is requested', async () => {
+        server.respondWith(request => request.respond(200, {'Content-Type': 'image/webp',
+            'Cache-Control': 'cache',
+            'Expires': 'expires'}, '0'));
+
+        const createImageBitmapSpy = vi.fn().mockResolvedValue({});
+        stubAjaxGetImage(createImageBitmapSpy);
+        const isSafariSpy = vi.spyOn(util, 'isSafari').mockReturnValue(true);
+
+        const options = {premultiplyAlpha: 'none'} as const;
+        const promise = ImageRequest.getImage({url: ''}, new AbortController(), true, options);
+        server.respond();
+
+        const response = await promise;
+        expect(response.data).toBeInstanceOf(HTMLImageElement);
+        expect(createImageBitmapSpy).not.toHaveBeenCalled();
+        expect(jxlSupport.isJXLSupported).toHaveBeenCalledWith(false);
+
+        isSafariSpy.mockRestore();
     });
 
     test('getImage respects maxParallelImageRequests and continues to respond even when server returns 404', async () => {
@@ -206,16 +381,100 @@ describe('ImageRequest', () => {
         expect((response.data as HTMLImageElement).crossOrigin).toBe('use-credentials');
     });
 
-    test('getImage using HTMLImageElement with accept header', async () => {
-        const makeRequestSky = vi.spyOn(ajax, 'makeRequest');
-        const promise = ImageRequest.getImage({url: '', credentials: 'include', headers: {accept: 'accept'}}, new AbortController(), false);
+    test.each(['accept', 'Accept', 'ACCEPT'])('sends an explicit %s header through makeRequest', async (name) => {
+        const makeRequestSpy = vi.spyOn(ajax, 'makeRequest');
+        const promise = ImageRequest.getImage({url: '', headers: {[name]: 'image/png'}}, new AbortController(), false);
+        expect(makeRequestSpy).toHaveBeenCalledTimes(1);
+        expect(jxlSupport.isJXLSupported).not.toHaveBeenCalled();
+        expect(server.requests[0].requestHeaders[name]).toBe('image/png');
+        server.requests[0].respond(200);
+        await expect(promise).resolves.toBeDefined();
+    });
 
-        expect(makeRequestSky).toHaveBeenCalledTimes(0);
-        makeRequestSky.mockClear();
+    test.each([true, false])('sends a detected Accept header with JXL support = %s', async (supported) => {
+        vi.mocked(jxlSupport.isJXLSupported).mockResolvedValue(supported);
+        const promise = ImageRequest.getImage({url: ''}, new AbortController());
+        expect(server.requests).toHaveLength(0);
+        await sleep(0);
+        expect(server.requests[0].requestHeaders.accept).toBe(supported ? 'image/jxl,image/webp,*/*' : 'image/webp,*/*');
+        server.requests[0].respond(200);
+        await expect(promise).resolves.toBeDefined();
+    });
 
-        const response = await promise;
-        expect(response.data).toBeInstanceOf(HTMLImageElement);
-        expect((response.data as HTMLImageElement).crossOrigin).toBe('use-credentials');
+    test.each([true, false])('fetch sends the detected header with JXL support = %s', async (supported) => {
+        vi.mocked(jxlSupport.isJXLSupported).mockResolvedValue(supported);
+        mockFetch();
+        await ImageRequest.getImage({url: 'http://localhost/image'}, new AbortController());
+        const request = vi.mocked(fetch).mock.calls[0][0] as Request;
+        expect(request.headers.get('Accept')).toBe(supported ? 'image/jxl,image/webp,*/*' : 'image/webp,*/*');
+    });
+
+    test.each([
+        {headers: {Accept: 'image/png'}},
+        {headers: new Headers({accept: 'image/png'})},
+        {headers: [['ACCEPT', 'image/png']]}
+    ])('preserves fetch Accept overrides in supported header representations: %j', async ({headers}) => {
+        mockFetch();
+        await ImageRequest.getImage({url: 'http://localhost/image', headers}, new AbortController(), false);
+        const request = vi.mocked(fetch).mock.calls[0][0] as Request;
+        expect(request.headers.get('Accept')).toBe('image/png');
+        expect(jxlSupport.isJXLSupported).not.toHaveBeenCalled();
+    });
+
+    test('native image requests bypass detection and do not add headers to caller parameters', async () => {
+        const parameters = {url: ''};
+        await ImageRequest.getImage(parameters, new AbortController(), false);
+        expect(jxlSupport.isJXLSupported).not.toHaveBeenCalled();
+        expect(parameters).toEqual({url: ''});
+        expect(server.requests).toHaveLength(0);
+    });
+
+    test('generated headers do not affect later requests reusing the same parameters', async () => {
+        const parameters = {url: '', headers: {}};
+        const first = ImageRequest.getImage(parameters, new AbortController());
+        server.requests[0].respond(200);
+        await first;
+        await ImageRequest.getImage(parameters, new AbortController(), false);
+        expect(parameters.headers).toEqual({});
+        expect(server.requests).toHaveLength(1);
+    });
+
+    test('canceling during detection releases a queue slot without canceling shared detection', async () => {
+        let finishDetection: (supported: boolean) => void;
+        const detection = new Promise<boolean>(resolve => { finishDetection = resolve; });
+        vi.mocked(jxlSupport.isJXLSupported).mockReturnValue(detection);
+        const controller = new AbortController();
+        const canceled = ImageRequest.getImage({url: 'canceled'}, controller);
+        const others = Array.from({length: config.MAX_PARALLEL_IMAGE_REQUESTS}, (_, i) =>
+            ImageRequest.getImage({url: `image-${i}`}, new AbortController()));
+        expect(jxlSupport.isJXLSupported).toHaveBeenCalledTimes(config.MAX_PARALLEL_IMAGE_REQUESTS);
+        controller.abort();
+        await expect(canceled).rejects.toSatisfy(isAbortError);
+        expect(jxlSupport.isJXLSupported).toHaveBeenCalledTimes(config.MAX_PARALLEL_IMAGE_REQUESTS + 1);
+        expect(server.requests).toHaveLength(0);
+        finishDetection(true);
+        await sleep(0);
+        expect(server.requests).toHaveLength(config.MAX_PARALLEL_IMAGE_REQUESTS);
+        for (const request of server.requests) {
+            expect(request.url).not.toBe('canceled');
+            expect(request.requestHeaders.accept).toContain('image/jxl');
+            request.respond(200);
+        }
+        await Promise.all(others);
+    });
+
+    test('custom protocols receive detected headers and retain cache metadata', async () => {
+        vi.mocked(jxlSupport.isJXLSupported).mockResolvedValue(true);
+        const handler = vi.fn().mockResolvedValue({data: new ArrayBuffer(0), cacheControl: 'max-age=60', expires: 'expiry'});
+        addProtocol('jxl-test', handler);
+        try {
+            const response = await ImageRequest.getImage({url: 'jxl-test://image'}, new AbortController(), false);
+            expect(handler.mock.calls[0][0].headers.accept).toBe('image/jxl,image/webp,*/*');
+            expect(response.cacheControl).toBe('max-age=60');
+            expect(response.expires).toBe('expiry');
+        } finally {
+            removeProtocol('jxl-test');
+        }
     });
 
     test('getImage uses makeRequest when custom Headers are added', () => {

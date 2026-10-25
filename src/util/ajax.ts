@@ -73,6 +73,8 @@ export type RequestParameters = {
  */
 export type GetResourceResponse<T> = ExpiryData & {
     data: T;
+    /** Response MIME type, retained when decoding negotiated image formats. */
+    contentType?: string | null;
 };
 
 /**
@@ -197,7 +199,7 @@ async function makeFetchRequest(requestParameters: RequestParameters, abortContr
     }
     const result = await parsePromise;
     throwIfAborted(abortController.signal);
-    return {data: result, cacheControl: response.headers.get('Cache-Control'), expires: response.headers.get('Expires'), etag: response.headers.get('ETag')};
+    return {data: result, cacheControl: response.headers.get('Cache-Control'), expires: response.headers.get('Expires'), etag: response.headers.get('ETag'), contentType: response.headers.get('Content-Type')};
 }
 
 function makeXMLHttpRequest(requestParameters: RequestParameters, abortController: AbortController): Promise<GetResourceResponse<any>> {
@@ -237,7 +239,7 @@ function makeXMLHttpRequest(requestParameters: RequestParameters, abortControlle
                         return;
                     }
                 }
-                resolve({data, cacheControl: xhr.getResponseHeader('Cache-Control'), expires: xhr.getResponseHeader('Expires'), etag: xhr.getResponseHeader('ETag')});
+                resolve({data, cacheControl: xhr.getResponseHeader('Cache-Control'), expires: xhr.getResponseHeader('Expires'), etag: xhr.getResponseHeader('ETag'), contentType: xhr.getResponseHeader('Content-Type')});
             } else {
                 const body = new Blob([xhr.response], {type: xhr.getResponseHeader('Content-Type')});
                 reject(new AJAXError(xhr.status, xhr.statusText, requestParameters.url, body));

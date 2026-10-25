@@ -162,7 +162,9 @@
     "bench": "vitest bench --run --config vitest.config.bench.ts --reporter=verbose",
     "bench-e2e": "node test/bench/e2e/run.ts",
     "prepare": "npm run codegen",
-    "typecheck": "tsgo --noEmit && tsgo --project tsconfig.dist.json"
+    "typecheck": "tsgo --noEmit && tsgo --project tsconfig.dist.json",
+    "test-skysight": "node test/skysight-smoke.mjs",
+    "build-skysight": "npm run codegen && npm run build-css && rolldown -c rolldown.config.skysight.ts"
   },
   "files": [
     "build/",

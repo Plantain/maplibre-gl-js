@@ -58,7 +58,7 @@ export class RasterDEMTileSource extends RasterTileSource implements Source {
         tile.neighboringTiles = this._getNeighboringTiles(tile.tileID);
         tile.abortController = new AbortController();
         try {
-            const response = await ImageRequest.transformAndGetImage(this.map._requestManager, url, ResourceType.Tile, tile.abortController, this.map._refreshExpiredTiles, {colorSpaceConversion: 'none'});
+            const response = await ImageRequest.transformAndGetImage(this.map._requestManager, url, ResourceType.Tile, tile.abortController, this.map._refreshExpiredTiles, {colorSpaceConversion: 'none'}, this._imageRequestScheduling);
             delete tile.abortController;
             if (tile.aborted) {
                 tile.state = 'unloaded';

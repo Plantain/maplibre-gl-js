@@ -27,6 +27,7 @@ export type AddProtocolAction = (requestParameters: RequestParameters, abortCont
 type Config = {
     MAX_PARALLEL_IMAGE_REQUESTS: number;
     MAX_PARALLEL_IMAGE_REQUESTS_PER_FRAME: number;
+    MAX_PARALLEL_PRELOAD_IMAGE_REQUESTS: number;
     MAX_TILE_CACHE_ZOOM_LEVELS: number;
     REGISTERED_PROTOCOLS: {[x: string]: AddProtocolAction };
     WORKER_URL: string;
@@ -35,6 +36,7 @@ type Config = {
 export const config: Config = {
     MAX_PARALLEL_IMAGE_REQUESTS: 16,
     MAX_PARALLEL_IMAGE_REQUESTS_PER_FRAME: 8,
+    MAX_PARALLEL_PRELOAD_IMAGE_REQUESTS: 2,
     MAX_TILE_CACHE_ZOOM_LEVELS: 5,
     REGISTERED_PROTOCOLS: {},
     WORKER_URL: ''

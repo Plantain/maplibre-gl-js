@@ -4505,6 +4505,8 @@ export class Map extends Evented<MapEventType> {
             }
         }
 
+        ImageRequest.processQueue();
+
         this._placementDirty = this.style?._updatePlacement(this._camera.transform, this.showCollisionBoxes, fadeDuration, this._crossSourceCollisions, globeRenderingChanged);
 
         const projection = this.style.projection;

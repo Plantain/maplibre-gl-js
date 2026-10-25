@@ -357,16 +357,20 @@ describe('RasterTileSource', () => {
         await expect(dataEvent).resolves.toBeDefined();
     });
 
-    test('loadTile uploads raster data without premultiplication after setPremultiplyAlpha(false)', async () => {
+    test.each(['setter', 'source option'])('loadTile preserves raw raster bytes using the %s', async (method) => {
         const source = createSource({
-            tiles: ['http://example.com/{z}/{x}/{y}.png']
+            tiles: ['http://example.com/{z}/{x}/{y}.png'],
+            premultiply: method !== 'source option'
         });
-        source.setPremultiplyAlpha(false);
+        if (method === 'setter') source.setPremultiplyAlpha(false);
         source.tiles = ['http://example.com/{z}/{x}/{y}.png'];
         source.map._refreshExpiredTiles = false;
 
-        const image = {width: 256, height: 256} as ImageBitmap;
-        const getImageSpy = vi.spyOn(ImageRequest, 'getImage').mockResolvedValue({data: image});
+        const image = new ImageBitmap();
+        Object.defineProperties(image, {width: {value: 256}, height: {value: 256}});
+        const decode = vi.fn().mockResolvedValue(image);
+        stubAjaxGetImage(decode);
+        server.respondWith('http://example.com/10/5/5.png', [200, {'Content-Type': 'image/jxl'}, 'image bytes']);
         const update = vi.fn();
         source.map.painter = {
             context: {gl: {}},
@@ -379,13 +383,14 @@ describe('RasterTileSource', () => {
             setExpiryData() {}
         } as any as Tile;
 
-        await source.loadTile(tile);
+        const loaded = source.loadTile(tile);
+        await sleep(0);
+        server.respond();
+        await loaded;
 
-        expect(getImageSpy).toHaveBeenCalledWith(
-            expect.anything(),
-            expect.any(AbortController),
-            false,
-            {premultiplyAlpha: 'none'}
+        expect(decode).toHaveBeenCalledWith(
+            expect.objectContaining({type: 'image/jxl'}),
+            {premultiplyAlpha: 'none', colorSpaceConversion: 'none'}
         );
         expect(update).toHaveBeenCalledWith(image, {useMipmap: true, premultiply: false});
         expect(tile.state).toBe('loaded');

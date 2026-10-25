@@ -450,3 +450,5 @@ export {
     getGlobalDispatcher,
     EXTENT
 };
+
+export type {ImageRequestPriority} from './util/image_request.ts';

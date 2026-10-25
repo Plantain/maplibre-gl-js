@@ -1,5 +1,6 @@
 import {type RequestParameters, makeRequest, sameOrigin, type GetResourceResponse} from './ajax.ts';
-import {arrayBufferToImageBitmap, arrayBufferToImage, ensureError, extend, isWorker, isImageBitmap} from './util.ts';
+import {arrayBufferToImageBitmap, arrayBufferToImage, isWorker, isImageBitmap, isSafari, ensureError} from './util.ts';
+import {isJXLSupported} from './jxl_supported.ts';
 import {config} from './config.ts';
 import {AbortError, throwIfAborted} from './abort_error.ts';
 import {getProtocol} from '../source/protocol_crud.ts';
@@ -8,19 +9,27 @@ import type {RequestManager, ResourceType} from './request_manager.ts';
 
 type ImageQueueThrottleControlCallback = () => boolean;
 
+export type ImageRequestPriority = 'normal' | 'preload';
+
+/** Source-owned callbacks let queued and running requests follow priority changes. */
+export type ImageRequestSchedulingOptions = {
+    getPriority: () => ImageRequestPriority;
+    isPaused?: () => boolean;
+};
+
 export type ImageRequestQueueItem  = {
     requestParameters: RequestParameters;
     supportImageRefresh: boolean;
     imageBitmapOptions?: ImageBitmapOptions;
+    schedulingOptions?: ImageRequestSchedulingOptions;
     state: 'queued' | 'running' | 'completed';
     abortController: AbortController;
     onError: (error: Error) => void;
     onSuccess: (response: GetResourceResponse<HTMLImageElement | ImageBitmap | null>) => void;
+    onAbort: () => void;
 };
 
-type ImageQueueThrottleCallbackDictionary = {
-    [Key: number]: ImageQueueThrottleControlCallback;
-};
+type ImageQueueThrottleCallbackDictionary = Record<number, ImageQueueThrottleControlCallback>;
 
 type HTMLImageElementWithPriority = HTMLImageElement &
 {
@@ -47,7 +56,7 @@ type HTMLImageElementWithPriority = HTMLImageElement &
  */
 export namespace ImageRequest {
     let imageRequestQueue : ImageRequestQueueItem[];
-    let currentParallelImageRequests:number;
+    let activeImageRequests: Set<ImageRequestQueueItem>;
 
     let throttleControlCallbackHandleCounter: number;
     let throttleControlCallbacks: ImageQueueThrottleCallbackDictionary;
@@ -56,8 +65,11 @@ export namespace ImageRequest {
      * Reset the image request queue, removing all pending requests.
      */
     export const resetRequestQueue = (): void => {
+        for (const request of imageRequestQueue || []) {
+            request.abortController.signal.removeEventListener('abort', request.onAbort);
+        }
         imageRequestQueue = [];
-        currentParallelImageRequests = 0;
+        activeImageRequests = new Set();
         throttleControlCallbackHandleCounter = 0;
         throttleControlCallbacks = {};
     };
@@ -110,6 +122,7 @@ export namespace ImageRequest {
      * @param supportImageRefresh - `true`, if the image request need to support refresh based on cache headers.
      * @param imageBitmapOptions - Options for `createImageBitmap`. Pass `{colorSpaceConversion: 'none'}` for images
      * whose pixels hold data rather than color, such as raster-DEM tiles, so the browser does not color manage them.
+     * @param schedulingOptions - Dynamic source priority and pause state for forecast preloads.
      * @returns - A promise resolved when the image is loaded.
      */
     export async function transformAndGetImage(
@@ -118,69 +131,105 @@ export namespace ImageRequest {
         resourceType: ResourceType,
         abortController: AbortController,
         supportImageRefresh: boolean = true,
-        imageBitmapOptions?: ImageBitmapOptions
+        imageBitmapOptions?: ImageBitmapOptions,
+        schedulingOptions?: ImageRequestSchedulingOptions
     ): Promise<GetResourceResponse<HTMLImageElement | ImageBitmap | null>> {
         const requestParameters = await requestManager.transformRequest(url, resourceType);
         throwIfAborted(abortController.signal);
-        return ImageRequest.getImage(requestParameters, abortController, supportImageRefresh, imageBitmapOptions);
+        return ImageRequest.getImage(requestParameters, abortController, supportImageRefresh, imageBitmapOptions, schedulingOptions);
     }
 
     /**
      * Request to load an image.
+     * Generated headers are kept separate from caller-provided headers so parameters can be reused.
      * @param requestParameters - Request parameters.
      * @param abortController - allows to abort the request.
      * @param supportImageRefresh - `true`, if the image request need to support refresh based on cache headers.
-     * @param imageBitmapOptions - Options for `createImageBitmap`. Pass `{colorSpaceConversion: 'none'}` for images
-     * whose pixels hold data rather than color, such as raster-DEM tiles, so the browser does not color manage them.
+     * @param schedulingOptions - Dynamic source priority and pause state for forecast preloads.
      * @returns - A promise resolved when the image is loaded.
      */
-    export const getImage = (
+    export function getImage(
         requestParameters: RequestParameters,
         abortController: AbortController,
         supportImageRefresh: boolean = true,
-        imageBitmapOptions?: ImageBitmapOptions
-    ): Promise<GetResourceResponse<HTMLImageElement | ImageBitmap | null>> => {
+        imageBitmapOptions?: ImageBitmapOptions,
+        schedulingOptions?: ImageRequestSchedulingOptions
+    ): Promise<GetResourceResponse<HTMLImageElement | ImageBitmap | null>> {
         return new Promise<GetResourceResponse<HTMLImageElement | ImageBitmap | null>>((resolve, reject) => {
-            requestParameters.headers ||= {};
-            requestParameters.headers.accept = 'image/webp,*/*';
-            extend(requestParameters, {type: 'image'});
+            if (abortController.signal.aborted) {
+                reject(new AbortError());
+                return;
+            }
+            const headers = requestParameters.headers;
             const request: ImageRequestQueueItem = {
                 abortController,
-                requestParameters,
+                requestParameters: {
+                    ...requestParameters,
+                    type: 'image',
+                    headers: headers instanceof Headers || Array.isArray(headers) ? Object.fromEntries(new Headers(headers)) : {...headers}
+                },
                 supportImageRefresh,
                 imageBitmapOptions,
+                schedulingOptions,
                 state: 'queued',
                 onError: (error: Error) => {
                     reject(error);
                 },
                 onSuccess: (response) => {
                     resolve(response);
+                },
+                onAbort: () => {
+                    if (request.state !== 'queued') return;
+                    const index = imageRequestQueue.indexOf(request);
+                    if (index < 0) return;
+                    imageRequestQueue.splice(index, 1);
+                    request.state = 'completed';
+                    abortController.signal.removeEventListener('abort', request.onAbort);
+                    reject(new AbortError());
+                    processQueue();
                 }
             };
 
             imageRequestQueue.push(request);
+            abortController.signal.addEventListener('abort', request.onAbort);
             processQueue();
+        });
+    }
+
+    const shouldUseImageBitmap = (imageBitmapOptions?: ImageBitmapOptions): boolean => {
+        const needsRawPixels = imageBitmapOptions?.premultiplyAlpha === 'none';
+        const useSafariHtmlImageFallback = needsRawPixels && !isWorker(self) && isSafari(globalThis);
+        return typeof createImageBitmap === 'function' && !useSafariHtmlImageFallback;
+    };
+
+    const arrayBufferToCanvasImageSource = (
+        data: ArrayBuffer,
+        contentType?: string | null,
+        imageBitmapOptions?: ImageBitmapOptions
+    ): Promise<HTMLImageElement | ImageBitmap | null> => {
+        if (shouldUseImageBitmap(imageBitmapOptions)) {
+            return arrayBufferToImageBitmap(data, imageBitmapOptions, contentType);
+        }
+        return arrayBufferToImage(data, contentType);
+    };
+
+    /** Wait for shared format detection without letting one request cancel the probe. */
+    const waitForJXLSupport = (support: Promise<boolean>, signal: AbortSignal): Promise<boolean> => {
+        return new Promise((resolve, reject) => {
+            if (signal.aborted) {
+                reject(new AbortError());
+                return;
+            }
+            const onAbort = () => reject(new AbortError());
+            signal.addEventListener('abort', onAbort, {once: true});
+            support.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
         });
     };
 
-    const arrayBufferToCanvasImageSource = (data: ArrayBuffer, imageBitmapOptions?: ImageBitmapOptions): Promise<HTMLImageElement | ImageBitmap | null> => {
-        const imageBitmapSupported = typeof createImageBitmap === 'function';
-        if (imageBitmapSupported) {
-            return arrayBufferToImageBitmap(data, imageBitmapOptions);
-        } else {
-            return arrayBufferToImage(data);
-        }
-    };
-
-    /**
-     * Runs one queued image request.
-     *
-     * An empty response body (e.g. HTTP 204 for a tile without content) resolves with
-     * `data: null`, keeping the expiry headers, so callers can handle the absence
-     * explicitly and re-request when the headers say so.
-     */
+    /** Loads and decodes a queued image; empty bodies resolve with null data and retain expiry metadata. */
     const doImageRequest = async (itemInQueue: ImageRequestQueueItem) => {
         itemInQueue.state = 'running';
+        itemInQueue.abortController.signal.removeEventListener('abort', itemInQueue.onAbort);
         const {requestParameters, supportImageRefresh, imageBitmapOptions, onError, onSuccess, abortController} = itemInQueue;
         // - If refreshExpiredTiles is false, then we can use HTMLImageElement to download raster images.
         // - Fetch/XHR (via MakeRequest API) will be used to download images for following scenarios:
@@ -195,57 +244,72 @@ export namespace ImageRequest {
             !imageBitmapOptions &&
             !isWorker(self) &&
             !getProtocol(requestParameters.url) &&
-            (!requestParameters.headers ||
-                Object.keys(requestParameters.headers).reduce((acc, item) => acc && item === 'accept', true));
+            Object.keys(requestParameters.headers).length === 0;
 
-        currentParallelImageRequests++;
-
-        const getImagePromise = canUseHTMLImageElement ?
-            getImageUsingHtmlImage(requestParameters, abortController) :
-            makeRequest(requestParameters, abortController);
+        activeImageRequests.add(itemInQueue);
 
         try {
-            const response = await getImagePromise;
+            if (!canUseHTMLImageElement && !Object.keys(requestParameters.headers).some(key => key.toLowerCase() === 'accept')) {
+                let supported = isJXLSupported(shouldUseImageBitmap(imageBitmapOptions));
+                if (typeof supported !== 'boolean') {
+                    supported = await waitForJXLSupport(supported, abortController.signal);
+                }
+                const fallback = 'image/webp,*/*';
+                requestParameters.headers.accept = supported ? `image/jxl,${fallback}` : fallback;
+            }
+            if (abortController.signal.aborted) throw new AbortError();
+            const response = await (canUseHTMLImageElement ?
+                getImageUsingHtmlImage(requestParameters, abortController) :
+                makeRequest(requestParameters, abortController));
             delete itemInQueue.abortController;
-            itemInQueue.state = 'completed';
-            if (response.data instanceof HTMLImageElement || isImageBitmap(response.data)) {
+            if ((typeof HTMLImageElement !== 'undefined' && response.data instanceof HTMLImageElement) || isImageBitmap(response.data)) {
                 // User using addProtocol can directly return HTMLImageElement/ImageBitmap type
                 // If HtmlImageElement is used to get image then response type will be HTMLImageElement
                 onSuccess(response);
             } else if (!response.data || response.data.byteLength === 0) {
-                onSuccess({data: null, cacheControl: response.cacheControl, expires: response.expires});
+                onSuccess({...response, data: null});
             } else {
-                const img = await arrayBufferToCanvasImageSource(response.data, imageBitmapOptions);
-                onSuccess({data: img, cacheControl: response.cacheControl, expires: response.expires});
+                const img = await arrayBufferToCanvasImageSource(response.data, response.contentType, imageBitmapOptions);
+                onSuccess({
+                    data: img,
+                    cacheControl: response.cacheControl,
+                    expires: response.expires,
+                    etag: response.etag,
+                    contentType: response.contentType
+                });
             }
         } catch (err) {
             delete itemInQueue.abortController;
             onError(ensureError(err));
         } finally {
-            currentParallelImageRequests--;
+            itemInQueue.state = 'completed';
+            activeImageRequests.delete(itemInQueue);
             processQueue();
         }
     };
 
-    /**
-     * Process some number of items in the image request queue.
-     */
-    const processQueue = (): void => {
+    const isPreload = (request: ImageRequestQueueItem): boolean =>
+        request.schedulingOptions?.getPriority() === 'preload';
+
+    /** Dispatches visible tiles first, preserving FIFO within each priority and limiting active preloads. */
+    export const processQueue = (): void => {
 
         const maxImageRequests = isThrottled() ?
             config.MAX_PARALLEL_IMAGE_REQUESTS_PER_FRAME :
             config.MAX_PARALLEL_IMAGE_REQUESTS;
 
         // limit concurrent image loads to help with raster sources performance on big screens
-        for (let numImageRequests = currentParallelImageRequests;
-            numImageRequests < maxImageRequests && imageRequestQueue.length > 0;
-            numImageRequests++) {
-
-            const topItemInQueue: ImageRequestQueueItem = imageRequestQueue.shift();
-            if (topItemInQueue.abortController.signal.aborted) {
-                numImageRequests--;
-                continue;
+        while (activeImageRequests.size < maxImageRequests && imageRequestQueue.length > 0) {
+            // Preserve FIFO within each priority, while allowing newly visible
+            // tiles to overtake speculative requests from the next forecast.
+            let index = imageRequestQueue.findIndex(request => !isPreload(request));
+            if (index < 0) {
+                const activePreloads = Array.from(activeImageRequests).filter(isPreload).length;
+                if (activePreloads >= config.MAX_PARALLEL_PRELOAD_IMAGE_REQUESTS) break;
+                index = imageRequestQueue.findIndex(request => !request.schedulingOptions?.isPaused?.());
+                if (index < 0) break;
             }
+            const [topItemInQueue] = imageRequestQueue.splice(index, 1);
             doImageRequest(topItemInQueue);
         }
     };
