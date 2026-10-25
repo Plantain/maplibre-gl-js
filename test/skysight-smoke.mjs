@@ -27,6 +27,7 @@ assert.equal(shared.length, 1);
 assert.ok(main.includes(manifest.worker));
 assert.ok(main.includes(shared[0]) && worker.includes(shared[0]));
 
+const tileAcceptHeaders = [];
 const server = createServer(async (request, response) => {
     try {
         const pathname = decodeURIComponent(new URL(request.url, 'http://localhost').pathname);
@@ -38,6 +39,7 @@ const server = createServer(async (request, response) => {
         const file = path.resolve(root, `.${pathname}`);
         if (!file.startsWith(`${root}${path.sep}`)) throw new Error('Invalid path');
         await stat(file);
+        if (/\.(mlt|mvt)$/.test(file)) tileAcceptHeaders.push(request.headers.accept);
         response.setHeader('Content-Type', file.endsWith('.js') ? 'text/javascript' : file.endsWith('.png') ? 'image/png' : 'application/octet-stream');
         response.end(await readFile(file));
     } catch {
@@ -79,6 +81,16 @@ try {
         await map.once('idle');
         const features = map.queryRenderedFeatures().length;
         if (!features) throw new Error('MLT worker did not render features');
+        map.addSource('fallback', {type: 'vector', encoding: 'mlt', tiles: [`${location.origin}/test/integration/assets/tiles/ocean.mvt`], minzoom: 5, maxzoom: 5});
+        map.addLayer({id: 'fallback', type: 'fill', source: 'fallback', 'source-layer': 'water', paint: {'fill-opacity': 0.1}});
+        await map.once('idle');
+        if (!map.queryRenderedFeatures({layers: ['fallback']}).length) throw new Error('MVT fallback did not render');
+        if (!map.querySourceFeatures('fallback', {sourceLayer: 'water'}).length) throw new Error('MVT fallback source query failed');
+        map.setFilter('fallback', ['==', ['geometry-type'], 'Polygon']);
+        await map.once('idle');
+        if (!map.queryRenderedFeatures({layers: ['fallback']}).length) throw new Error('MVT fallback reload lost its encoding');
+        map.removeLayer('fallback');
+        map.removeSource('fallback');
         map.addSource('geojson', {type: 'geojson', data: {type: 'Feature', id: 1, properties: {}, geometry: {type: 'Point', coordinates: [73, 36]}}});
         map.addLayer({id: 'point', type: 'circle', source: 'geojson', paint: {'circle-radius': 10, 'circle-color': '#ff0000'}});
         await map.once('idle');
@@ -153,6 +165,10 @@ try {
     }, {manifest, moduleUrl: process.env.MAPLIBRE_MODULE_URL, dataLayerUrl: process.env.MAPLIBRE_DATA_LAYER_URL});
     assert.deepEqual(errors, []);
     assert.deepEqual(result.mapErrors, []);
+    assert.ok(tileAcceptHeaders.length >= 2);
+    for (const accept of tileAcceptHeaders) {
+        assert.equal(accept, 'application/vnd.maplibre-tile, application/vnd.mapbox-vector-tile;q=0.9');
+    }
     assert.equal(result.excluded.length, 7);
     for (const feature of ['Heatmaps', 'Fill extrusions', 'Only Mercator', 'Font faces', 'Distance expressions', 'Within expressions', 'GeoJSON clustering']) {
         assert.ok(result.excluded.some(message => message.includes(feature)), `Missing exclusion error: ${feature}`);

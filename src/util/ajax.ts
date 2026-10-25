@@ -73,7 +73,7 @@ export type RequestParameters = {
  */
 export type GetResourceResponse<T> = ExpiryData & {
     data: T;
-    /** Response MIME type, retained when decoding negotiated image formats. */
+    /** Response MIME type, retained when decoding negotiated image and vector tile formats. */
     contentType?: string | null;
 };
 
@@ -291,7 +291,7 @@ export const getJSON = <T>(requestParameters: RequestParameters, abortController
     return makeRequest(extend(requestParameters, {type: 'json'}), abortController);
 };
 
-export const getArrayBuffer = (requestParameters: RequestParameters, abortController: AbortController): Promise<{data: ArrayBuffer} & ExpiryData> => {
+export const getArrayBuffer = (requestParameters: RequestParameters, abortController: AbortController): Promise<GetResourceResponse<ArrayBuffer>> => {
     return makeRequest(extend(requestParameters, {type: 'arrayBuffer'}), abortController);
 };
 

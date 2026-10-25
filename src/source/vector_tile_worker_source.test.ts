@@ -302,7 +302,7 @@ describe('vector tile worker source', () => {
             return {
                 vectorTile: new VectorTile(new PbfReader(rawTileData)),
                 rawData: rawTileData,
-                encoding: 'mvt'
+                encoding: 'mvt' as const
             };
         };
 
@@ -356,7 +356,7 @@ describe('vector tile worker source', () => {
             return {
                 vectorTile: new VectorTile(new PbfReader(rawTileData)),
                 rawData: rawTileData,
-                encoding: 'mvt'
+                encoding: 'mvt' as const
             };
         };
 
@@ -569,7 +569,7 @@ describe('vector tile worker source', () => {
                 rawData: rawTileData,
                 cacheControl: null,
                 expires: null,
-                encoding: 'mvt'
+                encoding: 'mvt' as const
             };
         };
 
@@ -633,7 +633,7 @@ describe('vector tile worker source', () => {
                 rawData: rawTileData,
                 cacheControl: null,
                 expires: null,
-                encoding: 'mvt'
+                encoding: 'mvt' as const
             };
         };
 

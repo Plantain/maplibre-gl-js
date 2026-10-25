@@ -650,7 +650,7 @@ describe('VectorTileSource', () => {
             expect(captured.data.request.headers).toBeUndefined();
         });
 
-        test('requests for MLT tiles with application/vnd.maplibre-tile', async () => {
+        test('requests MLT with MVT as a lower-priority fallback', async () => {
             const source = createSource({
                 tiles: ['http://example.com/{z}/{x}/{y}.mlt'],
                 encoding: 'mlt'
@@ -663,15 +663,16 @@ describe('VectorTileSource', () => {
                 loadVectorData() {},
             } as any as Tile);
 
-            expect(captured.data.request.headers.Accept).toBe('application/vnd.maplibre-tile');
+            expect(captured.data.request.headers.Accept).toBe('application/vnd.maplibre-tile, application/vnd.mapbox-vector-tile;q=0.9');
         });
 
-        test('respects Accept header set by transformRequest', async () => {
+        test.each(['Accept', 'accept'])('respects %s header set by transformRequest', async (header) => {
             const source = createSource({
-                tiles: ['http://example.com/{z}/{x}/{y}.pbf']
+                tiles: ['http://example.com/{z}/{x}/{y}.pbf'],
+                encoding: 'mlt'
             }, async (url) => ({
                 url,
-                headers: {Accept: 'application/x-custom'}
+                headers: {[header]: 'application/x-custom'}
             }));
             const captured = captureMessages(source);
             await waitForMetadataEvent(source);
@@ -681,7 +682,7 @@ describe('VectorTileSource', () => {
                 loadVectorData() {},
             } as any as Tile);
 
-            expect(captured.data.request.headers.Accept).toBe('application/x-custom');
+            expect(captured.data.request.headers).toEqual({[header]: 'application/x-custom'});
         });
 
         test('sets Accept header on overzoom requests', async () => {
@@ -699,7 +700,8 @@ describe('VectorTileSource', () => {
                 loadVectorData() {},
             } as any as Tile);
 
-            expect(captured.data.request.headers.Accept).toBe('application/vnd.maplibre-tile');
+            expect(captured.data.request.headers.Accept).toBe('application/vnd.maplibre-tile, application/vnd.mapbox-vector-tile;q=0.9');
+            expect(captured.data.overzoomParameters.overzoomRequest.headers.Accept).toBe(captured.data.request.headers.Accept);
         });
     });
  

@@ -14,7 +14,8 @@ import type {
     WorkerSource,
     WorkerTileParameters,
     TileParameters,
-    WorkerTileResult
+    WorkerTileResult,
+    TileEncoding
 } from '../source/worker_source.ts';
 import type {IActor} from '../util/actor.ts';
 import type {StyleLayer} from '../style/style_layer.ts';
@@ -23,7 +24,38 @@ import type {StyleLayerIndex} from '../style/style_layer_index.ts';
 export type LoadVectorTileResult = {
     vectorTile: VectorTileLike;
     rawData: ArrayBufferLike;
+    /** Actual response encoding, which can differ from the source's preferred encoding. */
+    encoding?: TileEncoding;
 };
+
+/**
+ * Uses an explicit tile MIME type when available. For MLT-enabled sources with generic binary
+ * responses, recognizes MLT's length-prefixed blocks and supported tags (1 and 2); other payloads
+ * use the MVT decoder. Empty responses retain the requested encoding and decode as empty tiles.
+ */
+function responseEncoding(rawData: ArrayBuffer, preferred: TileEncoding = 'mvt', contentType?: string | null): TileEncoding {
+    const mime = contentType?.split(';', 1)[0].trim().toLowerCase();
+    if (mime === 'application/vnd.maplibre-tile') return 'mlt';
+    if (['application/vnd.mapbox-vector-tile', 'application/x-protobuf', 'application/protobuf', 'application/vnd.google.protobuf', 'application/pbf'].includes(mime)) return 'mvt';
+    if (preferred !== 'mlt' || !rawData.byteLength) return preferred;
+
+    const reader = new PbfReader(rawData);
+    let hasLayer = false;
+    try {
+        while (reader.pos < reader.length) {
+            const length = reader.readVarint();
+            const end = reader.pos + length;
+            if (!length || end > reader.length) return 'mvt';
+            const tag = reader.readVarint();
+            if (reader.pos > end) return 'mvt';
+            hasLayer ||= tag === 1 || tag === 2;
+            reader.pos = end;
+        }
+    } catch {
+        return 'mvt';
+    }
+    return hasLayer ? 'mlt' : 'mvt';
+}
 
 /**
  * The {@link WorkerSource} implementation that supports {@link VectorTileSource}. This class is
@@ -45,15 +77,16 @@ export class VectorTileWorkerSource implements WorkerSource {
     }
 
     /**
-     * Loads a vector tile
+     * Decodes a tile using its response format, including legacy binary MVT responses to MLT requests.
      */
-    loadVectorTile(params: WorkerTileParameters, rawData: ArrayBuffer): LoadVectorTileResult {
+    loadVectorTile(params: WorkerTileParameters, rawData: ArrayBuffer, contentType?: string | null): LoadVectorTileResult {
         try {
-            const vectorTile = params.encoding !== 'mlt'
+            const encoding = responseEncoding(rawData, params.encoding, contentType);
+            const vectorTile = encoding !== 'mlt'
                 ? new VectorTile(new PbfReader(rawData))
                 : new MLTVectorTile(rawData);
 
-            return {vectorTile, rawData};
+            return {vectorTile, rawData, encoding};
         } catch (ex) {
             const bytes = new Uint8Array(rawData);
             const isGzipped = bytes[0] === 0x1f && bytes[1] === 0x8b;
@@ -96,7 +129,7 @@ export class VectorTileWorkerSource implements WorkerSource {
                 return this._getEtagUnmodifiedResult(tileResponse, timing);
             }
 
-            const tileResult = this.loadVectorTile(params, tileResponse.data);
+            const tileResult = this.loadVectorTile(params, tileResponse.data, tileResponse.contentType);
             this.tileState.finishLoading(uid);
             if (!tileResult) return null;
 
@@ -111,7 +144,8 @@ export class VectorTileWorkerSource implements WorkerSource {
             workerTile.vectorTile = vectorTile;
             workerTile.etag = tileResponse.etag;
             this.tileState.markLoaded(uid, workerTile);
-            const parsingState = {rawData, cacheControl, resourceTiming};
+            const encoding = overzoomParameters ? 'mvt' : tileResult.encoding ?? params.encoding ?? 'mvt';
+            const parsingState = {rawData, cacheControl, resourceTiming, encoding};
             this.tileState.setParsing(uid, parsingState);
 
             return await this._parseWorkerTile(workerTile, params);
@@ -137,9 +171,7 @@ export class VectorTileWorkerSource implements WorkerSource {
         // After the main thread has successfully received and stored rawTileData,
         // we no longer need to store it in the worker or transfer additional copies of it.
         if (parseState) {
-            const {rawData, cacheControl, resourceTiming} = parseState;
-            // Overzoomed tiles are always re-encoded to MVT protobuf by _getOverzoomTile
-            const encoding = params.overzoomParameters ? 'mvt' : params.encoding;
+            const {rawData, cacheControl, resourceTiming, encoding} = parseState;
             // Return a copy of rawData to the main thread to avoid clearing the worker's buffer
             result = extend({rawTileData: rawData.slice(0), encoding}, result, cacheControl, resourceTiming);
             this.tileState.removeParsing(workerTile.uid);

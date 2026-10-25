@@ -285,7 +285,7 @@ export class VectorTileSource extends Evented<SourceEventType> implements Source
     }
 
     /**
-     * Sets the Accept header specifically for MLT requests.
+     * Advertises MLT with MVT fallback for MLT-enabled sources, preserving caller-supplied headers.
      * 
      * @param request - parameters to update.
      * @see {@link https://github.com/maplibre/maplibre-native/pull/4231#discussion_r4216650681}
@@ -293,7 +293,9 @@ export class VectorTileSource extends Evented<SourceEventType> implements Source
     private _setAcceptHeader(request: RequestParameters) {
         if (this.encoding === 'mlt') {
             request.headers ??= {};
-            request.headers.Accept ??= 'application/vnd.maplibre-tile';
+            if (!Object.keys(request.headers).some(key => key.toLowerCase() === 'accept')) {
+                request.headers.Accept = 'application/vnd.maplibre-tile, application/vnd.mapbox-vector-tile;q=0.9';
+            }
         }
     }
 
