@@ -1,4 +1,4 @@
-import {ensureError, extend, pick} from '../util/util.ts';
+import {ensureError, extend, isImageBitmap, pick} from '../util/util.ts';
 import {ImageRequest, type ImageRequestPriority, type ImageRequestSchedulingOptions} from '../util/image_request.ts';
 import {ResourceType} from '../util/request_manager.ts';
 import {ErrorEvent, Evented} from '../util/evented.ts';
@@ -69,11 +69,13 @@ export class RasterTileSource extends Evented<SourceEventType> implements Source
     _loaded: boolean;
     _options: (RasterSourceSpecification | RasterDEMSourceSpecification) & {premultiply?: boolean};
     _requestPriority: ImageRequestPriority = 'normal';
+    _requestDependencies: string[] = [];
     _imageRequestScheduling: ImageRequestSchedulingOptions = {
         getPriority: () => this._requestPriority,
-        isPaused: () => this.map?.isMoving() ?? false
+        isPaused: () => this.requestsPaused()
     };
     _premultiplyAlpha: boolean;
+    _useMipmaps: boolean = true;
     _tileJSONRequest: AbortController;
 
     constructor(id: string, options: RasterSourceSpecification | RasterDEMSourceSpecification, dispatcher: Dispatcher, eventedParent: Evented) {
@@ -204,36 +206,82 @@ export class RasterTileSource extends Evented<SourceEventType> implements Source
         return this;
     }
 
+    /**
+     * Sets whether raster tiles allocate and generate mipmaps, reloading existing tiles on change.
+     * Disable for data textures whose renderers sample only the base level.
+     * This runtime setting is not included in the serialized style.
+     */
+    setMipmaps(enabled: boolean): this {
+        if (this._useMipmaps === enabled) return this;
+
+        this.setSourceProperty(() => {
+            this._useMipmaps = enabled;
+        });
+
+        return this;
+    }
+
     hasTile(tileID: OverscaledTileID): boolean {
         return !this.tileBounds || this.tileBounds.contains(tileID.canonical);
     }
 
     /**
-     * Prioritize displayed tiles over speculative preloads. Preloads share a
-     * two-request limit and pause while this map is moving. Changes also apply
-     * to requests already queued, without discarding downloaded tile data.
+     * Normal images precede visible fallbacks, which precede speculative preloads.
+     * Fallbacks use available queue capacity; preloads share a two-request limit.
+     * Both lower priorities pause while moving or waiting for request dependencies.
+     * Changes apply to queued requests without discarding downloaded tile data.
+     * @param priority - Image queue priority.
+     * @param dependencies - Source IDs to wait for, updated atomically with priority when supplied.
      */
-    setRequestPriority(priority: ImageRequestPriority): this {
-        if (priority !== 'normal' && priority !== 'preload') {
+    setRequestPriority(priority: ImageRequestPriority, dependencies?: string[]): this {
+        if (priority !== 'normal' && priority !== 'fallback' && priority !== 'preload') {
             throw new Error(`Invalid raster request priority: ${priority}`);
         }
-        if (this._requestPriority !== priority) {
+        if (dependencies?.includes(this.id)) throw new Error('A raster source cannot depend on itself');
+        if (dependencies) this._requestDependencies = [...new Set(dependencies)];
+        if (this._requestPriority !== priority || dependencies) {
             this._requestPriority = priority;
             ImageRequest.processQueue();
         }
         return this;
     }
 
-    /** Returns whether this source supplies displayed tiles or speculative forecast preloads. */
+    /** Returns this source's image queue priority. */
     getRequestPriority(): ImageRequestPriority {
         return this._requestPriority;
+    }
+
+    /**
+     * Hold fallback/preload requests until the named sources finish loading the current view.
+     * Dependencies can be vector sources, including MLTs fetched outside the image queue.
+     * Missing dependencies hold requests until replaced or cleared. Failed tiles count as
+     * settled, following Map.isSourceLoaded. In-flight requests and cached tiles are retained.
+     * The map reconsiders the queue after updating sources on each render.
+     */
+    setRequestDependencies(sourceIds: string[]): this {
+        return this.setRequestPriority(this._requestPriority, sourceIds);
+    }
+
+    /** Returns a copy of the source IDs that must settle before lower-priority requests start. */
+    getRequestDependencies(): string[] {
+        return this._requestDependencies.slice();
+    }
+
+    /** Wait for viewport updates before inspecting dependencies whose tile sets may be stale. */
+    private requestsPaused(): boolean {
+        if (this.map?.isMoving()) return true;
+        if (!this._requestDependencies.length) return false;
+        if (!this.map || this.map._sourcesDirty) return true;
+        return this._requestDependencies.some(id => !this.map.getSource(id) || !this.map.isSourceLoaded(id));
     }
 
     async loadTile(tile: Tile): Promise<void> {
         const url = tile.tileID.canonical.url(this.tiles, this.map.getPixelRatio(), this.scheme, this.map.style.projection.worldCoordinateHelper.tileMatrixSet);
         const premultiply = this._premultiplyAlpha;
+        const useMipmap = this._useMipmaps;
         const imageBitmapOptions = premultiply ? undefined : {premultiplyAlpha: 'none', colorSpaceConversion: 'none'} as const;
         tile.abortController = new AbortController();
+        let image: HTMLImageElement | ImageBitmap | null = null;
         try {
             const response = await ImageRequest.transformAndGetImage(
                 this.map._requestManager,
@@ -244,6 +292,7 @@ export class RasterTileSource extends Evented<SourceEventType> implements Source
                 imageBitmapOptions,
                 this._imageRequestScheduling
             );
+            image = response?.data;
             delete tile.abortController;
             if (tile.aborted) {
                 tile.state = 'unloaded';
@@ -261,10 +310,10 @@ export class RasterTileSource extends Evented<SourceEventType> implements Source
                 const img = response.data ?? new RGBAImage({width: 1, height: 1}, new Uint8Array(4));
                 tile.texture = this.map.painter.getTileTexture(img.width);
                 if (tile.texture) {
-                    tile.texture.update(img, {useMipmap: true, premultiply});
+                    tile.texture.update(img, {useMipmap, premultiply});
                 } else {
-                    tile.texture = new Texture(context, img, gl.RGBA, {useMipmap: true, premultiply});
-                    tile.texture.bind(gl.LINEAR, gl.CLAMP_TO_EDGE, gl.LINEAR_MIPMAP_NEAREST);
+                    tile.texture = new Texture(context, img, gl.RGBA, {useMipmap, premultiply});
+                    tile.texture.bind(gl.LINEAR, gl.CLAMP_TO_EDGE, useMipmap ? gl.LINEAR_MIPMAP_NEAREST : gl.LINEAR);
                 }
                 tile.state = 'loaded';
             }
@@ -276,6 +325,8 @@ export class RasterTileSource extends Evented<SourceEventType> implements Source
                 tile.state = 'errored';
                 throw err;
             }
+        } finally {
+            if (isImageBitmap(image)) image.close();
         }
     }
 

@@ -98,6 +98,24 @@ describe('ImageRequest', () => {
         await Promise.all(pending);
     });
 
+    test('normal images overtake fallbacks, which overtake speculative preloads', async () => {
+        const pending = [];
+        for (let i = 0; i < config.MAX_PARALLEL_IMAGE_REQUESTS; i++) {
+            pending.push(ImageRequest.getImage({url: `active-${i}`}, new AbortController()));
+        }
+        for (const priority of ['preload', 'fallback', 'normal'] as const) {
+            pending.push(ImageRequest.getImage({url: priority}, new AbortController(), true, undefined, {getPriority: () => priority}));
+        }
+        for (let i = 0; i < 3; i++) {
+            server.requests[i].respond(200);
+            await sleep(0);
+        }
+        expect(server.requests.slice(config.MAX_PARALLEL_IMAGE_REQUESTS).map(request => request.url))
+            .toEqual(['normal', 'fallback', 'preload']);
+        for (const request of server.requests.slice(3)) request.respond(200);
+        await Promise.all(pending);
+    });
+
     test('promoting a source immediately updates queued and running requests without refetching', async () => {
         let priority: 'normal' | 'preload' = 'preload';
         const scheduling: ImageRequestSchedulingOptions = {getPriority: () => priority};

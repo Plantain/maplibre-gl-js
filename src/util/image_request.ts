@@ -9,7 +9,7 @@ import type {RequestManager, ResourceType} from './request_manager.ts';
 
 type ImageQueueThrottleControlCallback = () => boolean;
 
-export type ImageRequestPriority = 'normal' | 'preload';
+export type ImageRequestPriority = 'normal' | 'fallback' | 'preload';
 
 /** Source-owned callbacks let queued and running requests follow priority changes. */
 export type ImageRequestSchedulingOptions = {
@@ -291,7 +291,11 @@ export namespace ImageRequest {
     const isPreload = (request: ImageRequestQueueItem): boolean =>
         request.schedulingOptions?.getPriority() === 'preload';
 
-    /** Dispatches visible tiles first, preserving FIFO within each priority and limiting active preloads. */
+    /**
+     * Dispatches normal images, then eligible visible fallbacks, then speculative preloads.
+     * Fallbacks use available capacity; only preloads have the two-request allowance.
+     * Paused fallbacks remain queued while their regional sources load, including after pans.
+     */
     export const processQueue = (): void => {
 
         const maxImageRequests = isThrottled() ?
@@ -302,11 +306,16 @@ export namespace ImageRequest {
         while (activeImageRequests.size < maxImageRequests && imageRequestQueue.length > 0) {
             // Preserve FIFO within each priority, while allowing newly visible
             // tiles to overtake speculative requests from the next forecast.
-            let index = imageRequestQueue.findIndex(request => !isPreload(request));
+            let index = imageRequestQueue.findIndex(request =>
+                !request.schedulingOptions || request.schedulingOptions.getPriority() === 'normal');
+            if (index < 0) {
+                index = imageRequestQueue.findIndex(request =>
+                    request.schedulingOptions?.getPriority() === 'fallback' && !request.schedulingOptions.isPaused?.());
+            }
             if (index < 0) {
                 const activePreloads = Array.from(activeImageRequests).filter(isPreload).length;
                 if (activePreloads >= config.MAX_PARALLEL_PRELOAD_IMAGE_REQUESTS) break;
-                index = imageRequestQueue.findIndex(request => !request.schedulingOptions?.isPaused?.());
+                index = imageRequestQueue.findIndex(request => isPreload(request) && !request.schedulingOptions?.isPaused?.());
                 if (index < 0) break;
             }
             const [topItemInQueue] = imageRequestQueue.splice(index, 1);

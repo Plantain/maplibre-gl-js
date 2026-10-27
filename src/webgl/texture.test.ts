@@ -83,6 +83,28 @@ describe('Texture', () => {
         expect(gl.texParameteri).toHaveBeenCalledWith(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     });
 
+    test('pooled RGBA textures reallocate when their mipmap mode changes', () => {
+        const gl = createNullGL();
+        const image = new RGBAImage({width: 256, height: 256}, new Uint8Array(256 * 256 * 4));
+        const texture = new Texture(new Context(gl), image, gl.RGBA, {useMipmap: true});
+        texture.bind(gl.LINEAR, gl.CLAMP_TO_EDGE, gl.LINEAR_MIPMAP_NEAREST);
+
+        for (const useMipmap of [false, true]) {
+            const oldHandle = texture.texture;
+            vi.mocked(gl.generateMipmap).mockClear();
+            texture.update(image, {useMipmap});
+            texture.bind(gl.LINEAR, gl.CLAMP_TO_EDGE, gl.LINEAR_MIPMAP_NEAREST);
+            expect(gl.deleteTexture).toHaveBeenCalledWith(oldHandle);
+            expect(texture.texture).not.toBe(oldHandle);
+            expect(gl.texStorage2D).toHaveBeenLastCalledWith(gl.TEXTURE_2D, useMipmap ? 9 : 1, gl.RGBA8, 256, 256);
+            expect(gl.generateMipmap).toHaveBeenCalledTimes(useMipmap ? 1 : 0);
+            expect(gl.texParameteri).toHaveBeenCalledWith(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, useMipmap ? gl.LINEAR_MIPMAP_NEAREST : gl.LINEAR);
+            const reusedHandle = texture.texture;
+            texture.update(image, {useMipmap});
+            expect(texture.texture).toBe(reusedHandle);
+        }
+    });
+
     test('bind writes the min filter on its own when only the min filter changes', () => {
         const gl = createNullGL();
         const context = new Context(gl);

@@ -48,6 +48,10 @@ export class Texture {
         this.update(image, options);
     }
 
+    /**
+     * Uploads pixels, reallocating immutable RGBA storage when size or mipmap mode changes.
+     * Pooled textures release unused mip levels when reused without mipmaps.
+     */
     update(image: TextureImage, options?: {
         premultiply?: boolean;
         useMipmap?: boolean;
@@ -56,11 +60,13 @@ export class Texture {
         y: number;
     }): void {
         const {width, height} = image as {width: number; height: number};
-        const resize = (this.size?.[0] !== width || this.size[1] !== height) && !position;
         const {context} = this;
         const {gl} = context;
+        const useMipmap = Boolean(options?.useMipmap);
+        const mipmapStorageChanged = this.format === gl.RGBA && this.useMipmap !== useMipmap;
+        const resize = !position && (this.size?.[0] !== width || this.size[1] !== height || mipmapStorageChanged);
 
-        this.useMipmap = Boolean(options?.useMipmap);
+        this.useMipmap = useMipmap;
 
         if (resize && this.size && this.format === gl.RGBA) {
             gl.deleteTexture(this.texture);
