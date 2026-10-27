@@ -16,6 +16,7 @@ import {FeatureIndexArray} from './array_types.g.ts';
 import {MLTVectorTile} from '../source/vector_tile_mlt.ts';
 import {Bounds} from '../geo/bounds.ts';
 import {VectorTile} from '@mapbox/vector-tile';
+import {decodedMLTCache} from './decoded_tile_cache.ts';
 
 import type Point from '@mapbox/point-geometry';
 import type {OverscaledTileID} from '../tile/tile_id.ts';
@@ -56,6 +57,9 @@ export type QueryResultsItem = {
     feature: GeoJSONFeature;
     intersectionZ?: boolean | number;
 };
+
+/** Decode provenance is local to this realm and is never serialized to a worker. */
+const decodedInputs = new WeakMap<FeatureIndex, {data: ArrayBuffer; encoding: TileEncoding}>();
 
 /**
  * An in memory index class to allow fast interaction with features
@@ -112,23 +116,42 @@ export class FeatureIndex {
         }
     }
 
-    loadVTLayers(): {[_: string]: VectorTileLayerLike} {
-        if (!this.vtLayers) {
-            switch (this.encoding) {
-                case 'mlt':
-                    this.vtLayers = new MLTVectorTile(this.rawTileData).layers;
-                    break;
-                case 'mvt':
-                default:
-                    this.vtLayers = new VectorTile(new PbfReader(this.rawTileData)).layers;
-            }
-            this.sourceLayerCoder = new DictionaryCoder(this.vtLayers ? Object.keys(this.vtLayers).sort() : [GEOJSON_TILE_LAYER_NAME]);
+    loadVTLayers(): Record<string, VectorTileLayerLike> {
+        const previous = decodedInputs.get(this);
+        if (previous && (previous.data !== this.rawTileData || previous.encoding !== this.encoding)) this.releaseVTLayers();
+        if (this.vtLayers) {
+            if (this.encoding === 'mlt') decodedMLTCache.touch(this);
+            return this.vtLayers;
         }
-        return this.vtLayers;
+        const tile = this.encoding === 'mlt'
+            ? new MLTVectorTile(this.rawTileData)
+            : new VectorTile(new PbfReader(this.rawTileData));
+        const layers = this.vtLayers = tile.layers;
+        this.sourceLayerCoder = new DictionaryCoder(Object.keys(layers).sort());
+        decodedInputs.set(this, {data: this.rawTileData, encoding: this.encoding});
+        if (tile instanceof MLTVectorTile) decodedMLTCache.add(this, tile.byteLength);
+        return layers;
+    }
+
+    /** Releases derived query data while preserving raw bytes for subsequent queries. */
+    releaseVTLayers(): void {
+        decodedMLTCache.delete(this);
+        decodedInputs.delete(this);
+        this.vtLayers = undefined;
+        this.sourceLayerCoder = undefined;
     }
 
     // Finds non-symbol features in this tile at a particular position.
     query(
+        args: QueryParameters,
+        styleLayers: {[_: string]: StyleLayer},
+        serializedLayers: {[_: string]: any},
+        sourceFeatureState: SourceFeatureState
+    ): QueryResults {
+        return decodedMLTCache.withPinned(this, () => this.queryFeatures(args, styleLayers, serializedLayers, sourceFeatureState));
+    }
+
+    private queryFeatures(
         args: QueryParameters,
         styleLayers: {[_: string]: StyleLayer},
         serializedLayers: {[_: string]: any},
@@ -292,6 +315,22 @@ export class FeatureIndex {
         filterLayerIDs: Set<string> | null,
         availableImages: string[],
         styleLayers: {[_: string]: StyleLayer}): QueryResults {
+        return decodedMLTCache.withPinned(this, () => this.querySymbolFeatures(symbolFeatureIndexes, serializedLayers,
+            bucketIndex, sourceLayerIndex, filterParams, filterLayerIDs, availableImages, styleLayers));
+    }
+
+    private querySymbolFeatures(symbolFeatureIndexes: number[],
+        serializedLayers: {[_: string]: StyleLayer},
+        bucketIndex: number,
+        sourceLayerIndex: number,
+        filterParams: {
+            filterSpec: FilterSpecification;
+            globalState: Record<string, any>;
+            worldCoordinateHelper: WorldCoordinateHelper;
+        },
+        filterLayerIDs: Set<string> | null,
+        availableImages: string[],
+        styleLayers: {[_: string]: StyleLayer}): QueryResults {
         const result: QueryResults = {};
         this.loadVTLayers();
 
@@ -344,7 +383,7 @@ export class FeatureIndex {
 register(
     'FeatureIndex',
     FeatureIndex,
-    {omit: ['rawTileData', 'sourceLayerCoder']}
+    {omit: ['rawTileData', 'sourceLayerCoder', 'vtLayers']}
 );
 
 /**

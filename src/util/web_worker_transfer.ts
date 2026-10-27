@@ -3,6 +3,9 @@ import {Color, CompoundExpression, expressions, ResolvedImage, StylePropertyFunc
     StyleExpression, ZoomDependentExpression, ZoomConstantExpression} from '@maplibre/maplibre-gl-style-spec';
 import {AJAXError} from './ajax.ts';
 import {isImageBitmap} from './util.ts';
+import {installExpressionContextCleanup} from '../style/expression_context.ts';
+
+installExpressionContextCleanup();
 
 /**
  * A class that is serialized to and json, that can be constructed back to the original class in the worker or in the main thread

@@ -288,6 +288,7 @@ export class Tile {
         }
 
         if (data.featureIndex) {
+            if (this.latestFeatureIndex !== data.featureIndex) this.latestFeatureIndex?.releaseVTLayers();
             this.latestFeatureIndex = data.featureIndex;
             if (data.rawTileData) {
                 // Only vector tiles have rawTileData, and they won't update it for
@@ -367,6 +368,7 @@ export class Tile {
 
         this.imageAtlas = null;
         this.dashPositions = null;
+        this.latestFeatureIndex?.releaseVTLayers();
         this.latestFeatureIndex = null;
         this.state = 'unloaded';
     }

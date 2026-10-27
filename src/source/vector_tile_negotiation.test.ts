@@ -77,7 +77,7 @@ test.each([
     tile.loadVectorData(await source.reloadTile(params), null);
     const reloadedFeatures = [];
     tile.querySourceFeatures(reloadedFeatures, {sourceLayer, worldCoordinateHelper});
-    expect(reloadedFeatures).toEqual(features);
+    expect(reloadedFeatures.map(feature => feature.toJSON())).toEqual(features.map(feature => feature.toJSON()));
 
     const refresh = source.loadTile({...params, etag: '"v1"'});
     server.respond();

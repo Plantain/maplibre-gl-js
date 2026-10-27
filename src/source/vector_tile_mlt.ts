@@ -1,19 +1,23 @@
-import Point from '@mapbox/point-geometry';
-import {type FeatureTable, decodeTile, type Feature as MLTFeature, GEOMETRY_TYPE} from '@maplibre/mlt';
+import {decodeTile, GEOMETRY_TYPE} from '@maplibre/mlt';
+import {arrayBufferSize} from '../util/array_buffer_size.ts';
+import {MLTGeometry} from './vector_tile_mlt_geometry.ts';
 
+import type Point from '@mapbox/point-geometry';
+import type {FeatureTable} from '@maplibre/mlt';
 import type {VectorTileFeatureLike, VectorTileLayerLike, VectorTileLike} from '@maplibre/vt-pbf';
 
 class MLTVectorTileFeature implements VectorTileFeatureLike {
-    _featureData: MLTFeature;
-    properties: {[_: string]: any};
+    private readonly layer: MLTVectorTileLayer;
+    private readonly index: number;
+    private materializedProperties: Record<string, any>;
     type: VectorTileFeatureLike['type'];
     extent: VectorTileFeatureLike['extent'];
     id: VectorTileFeatureLike['id'];
 
-    constructor(feature: MLTFeature, extent: number) {
-        this._featureData = feature;
-        this.properties = this._featureData.properties || {};
-        switch (this._featureData.geometry?.type) {
+    constructor(layer: MLTVectorTileLayer, index: number) {
+        this.layer = layer;
+        this.index = index;
+        switch (layer.geometry.geometryType(index)) {
             case GEOMETRY_TYPE.POINT:
             case GEOMETRY_TYPE.MULTIPOINT:
                 this.type = 1;
@@ -28,51 +32,61 @@ class MLTVectorTileFeature implements VectorTileFeatureLike {
                 break;
             default:
                 this.type = 0;
-        };
-        this.extent = extent;
-        this.id = Number(this._featureData.id);
+        }
+        this.extent = layer.extent;
+        this.id = Number(layer.idVector?.getValue(index) ?? undefined);
+    }
+
+    /** Materializes properties for this feature wrapper without expanding the layer's other features. */
+    get properties(): Record<string, any> {
+        if (this.materializedProperties) return this.materializedProperties;
+        const properties: Record<string, any> = {};
+        for (const column of this.layer.propertyVectors) {
+            if (!column) continue;
+            const value = column.getValue(this.index);
+            if (value !== null) properties[column.name] = value;
+        }
+        return this.materializedProperties = properties;
     }
 
     loadGeometry(): Point[][] {
-        const points: Point[][] = [];
-        for (const ring of this._featureData.geometry.coordinates) {
-            const pointRing: Point[] = [];
-            for (const coord of ring) {
-                pointRing.push(new Point(coord.x, coord.y));
-            }
-            points.push(pointRing);
-        }
-        return points;
+        return this.layer.geometry.loadGeometry(this.index);
     }
 }
 
 class MLTVectorTileLayer implements VectorTileLayerLike {
-    featureTable: FeatureTable;
+    idVector: FeatureTable['idVector'];
+    propertyVectors: FeatureTable['propertyVectors'];
     name: string;
     length: number;
     version: number;
     extent: number;
-    features: MLTFeature[] = [];
-    
+    geometry: MLTGeometry;
+
     constructor(featureTable: FeatureTable) {
-        this.featureTable = featureTable;
+        this.idVector = featureTable.idVector;
+        this.propertyVectors = featureTable.propertyVectors;
         this.name = featureTable.name;
         this.extent = featureTable.extent;
         this.version = 2;
-        this.features = featureTable.getFeatures();
-        this.length = this.features.length;
+        this.length = featureTable.numFeatures;
+        this.geometry = new MLTGeometry(featureTable.geometryVector);
     }
 
     feature(i: number): VectorTileFeatureLike {
-        return new MLTVectorTileFeature(this.features[i], this.extent);
+        if (!Number.isInteger(i) || i < 0 || i >= this.length) throw new RangeError('MLT feature index out of bounds');
+        return new MLTVectorTileFeature(this, i);
     }
 }
 
 export class MLTVectorTile implements VectorTileLike {
     layers: Record<string, VectorTileLayerLike> = {};
+    /** Unique decoded backing stores, excluding the response body and JS object overhead. */
+    readonly byteLength: number;
 
     constructor(buffer: ArrayBuffer) {
         const features = decodeTile(new Uint8Array(buffer));
-        this.layers = features.reduce((acc, f) => ({...acc, [f.name]: new MLTVectorTileLayer(f)}), {});
+        for (const table of features) this.layers[table.name] = new MLTVectorTileLayer(table);
+        this.byteLength = arrayBufferSize(this.layers, buffer);
     }
 }
