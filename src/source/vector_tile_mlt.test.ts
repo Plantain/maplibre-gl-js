@@ -11,6 +11,7 @@ import {MLTGeometry, compactCoordinates, compactOffsets} from './vector_tile_mlt
 import {loadGeometry} from '../data/load_geometry.ts';
 import {sliceVectorTileLayer} from './vector_tile_overzoomed.ts';
 import {CanonicalTileID} from '../tile/tile_id.ts';
+import {arrayBufferSize} from '../util/array_buffer_size.ts';
 
 import type {FeatureInput, FeatureGeometry} from '@maplibre/mlt';
 import type {VectorTileLayerLike} from '@maplibre/vt-pbf';
@@ -126,6 +127,7 @@ describe('packed MLT vector tile adapter', () => {
         try {
             const actual = new MLTVectorTile(buffer);
             for (const [name, layer] of Object.entries(actual.layers)) compareLayer(layer, references[name]);
+            expect(actual.byteLength).toBe(arrayBufferSize(actual.layers, buffer));
             expect(allFeatures).not.toHaveBeenCalled();
             expect(allGeometry).not.toHaveBeenCalled();
         } finally {
@@ -183,5 +185,16 @@ describe('packed MLT vector tile adapter', () => {
         const layer = new MLTVectorTile(buffer).layers.point;
         expect(layer.feature(0).id).toBeNaN();
         for (const index of [-1, 1, 0.5]) expect(() => layer.feature(index)).toThrow(RangeError);
+    });
+
+    test('measures tiles with large nested property arrays without hitting argument limits', () => {
+        const samples = Array.from({length: 150000}, (_, i) => i);
+        const buffer = Uint8Array.from(encodeTile([{name: 'forecast', features: [{
+            geometry: {type: 'Point', coordinates: [10, 20]}, properties: {samples}
+        }]}])).buffer;
+        const tile = new MLTVectorTile(buffer);
+        expect(tile.layers.forecast.feature(0).properties.samples).toEqual(samples);
+        expect(tile.layers.forecast.feature(0).loadGeometry()).toEqual([[new Point(10, 20)]]);
+        expect(tile.byteLength).toBeGreaterThan(0);
     });
 });

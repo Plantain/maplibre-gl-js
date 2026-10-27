@@ -7,9 +7,18 @@ export function arrayBufferSize(root: unknown, excluded?: ArrayBuffer): number {
         const value = pending.pop();
         if (!value || typeof value !== 'object' || seen.has(value)) continue;
         seen.add(value);
-        if (value instanceof ArrayBuffer) buffers.add(value);
-        else if (ArrayBuffer.isView(value)) buffers.add(value.buffer);
-        else pending.push(...Object.values(value));
+        if (value instanceof ArrayBuffer) {
+            buffers.add(value);
+            continue;
+        }
+        if (ArrayBuffer.isView(value)) {
+            buffers.add(value.buffer);
+            continue;
+        }
+        const children = Array.isArray(value) ? value : Object.values(value);
+        for (const child of children) {
+            if (child && typeof child === 'object') pending.push(child);
+        }
     }
     buffers.delete(excluded);
     let bytes = 0;

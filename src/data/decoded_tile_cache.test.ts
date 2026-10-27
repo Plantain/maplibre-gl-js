@@ -1,4 +1,6 @@
 import {afterEach, expect, test} from 'vitest';
+import {readFileSync} from 'node:fs';
+import path from 'node:path';
 import {encodeTile} from '@maplibre/mlt';
 import {DecodedTileCache, decodedMLTCache} from './decoded_tile_cache.ts';
 import {FeatureIndex} from './feature_index.ts';
@@ -10,6 +12,7 @@ import {EvaluationParameters} from '../style/evaluation_parameters.ts';
 import {loadGeometry} from './load_geometry.ts';
 import {createMercatorTransform} from '../geo/projection/mercator_transform.ts';
 import Point from '@mapbox/point-geometry';
+import {arrayBufferSize} from '../util/array_buffer_size.ts';
 
 import type {VectorTileLayerLike} from '@maplibre/vt-pbf';
 import type {WorkerTileResult} from '../source/worker_source.ts';
@@ -58,6 +61,27 @@ test('pins oversized entries through nested queries and releases them after a th
     })).toThrow('query failed');
     expect(a.vtLayers).toBeUndefined();
     expect(cache.byteLength).toBe(0);
+});
+
+test('keeps decoded FSST query buffers within the budget after reading properties', () => {
+    const fixture = readFileSync(path.join(__dirname, '../../test/integration/assets/tiles/mlt/5/22/12.mlt'));
+    const indexes: FeatureIndex[] = [];
+    for (let i = 0; i < 30; i++) {
+        const tileID = new OverscaledTileID(5, i, 5, 22, 12);
+        const index = new FeatureIndex(tileID);
+        const tile = new Tile(tileID, 512);
+        tile.loadVectorData({featureIndex: index, rawTileData: Uint8Array.from(fixture).buffer,
+            encoding: 'mlt', buckets: []} as WorkerTileResult, null);
+        indexes.push(index);
+        for (const sourceLayer of Object.keys(index.loadVTLayers())) {
+            tile.querySourceFeatures([], {sourceLayer, worldCoordinateHelper: mercatorWorldCoordinateHelper});
+        }
+    }
+    const retainedBytes = indexes.reduce((sum, index) => sum + arrayBufferSize(index.vtLayers, index.rawTileData), 0);
+    expect(retainedBytes).toBeGreaterThan(0);
+    expect(retainedBytes).toBe(decodedMLTCache.byteLength);
+    expect(retainedBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
+    expect(indexes[0].vtLayers).toBeUndefined();
 });
 
 function pointTile(value: number): ArrayBuffer {

@@ -1,4 +1,5 @@
 import {decodeTile, GEOMETRY_TYPE} from '@maplibre/mlt';
+import {StringFsstDictionaryVector} from '@maplibre/mlt/dist/vector/fsst-dictionary/stringFsstDictionaryVector';
 import {arrayBufferSize} from '../util/array_buffer_size.ts';
 import {MLTGeometry} from './vector_tile_mlt_geometry.ts';
 
@@ -66,6 +67,7 @@ class MLTVectorTileLayer implements VectorTileLayerLike {
     constructor(featureTable: FeatureTable) {
         this.idVector = featureTable.idVector;
         this.propertyVectors = featureTable.propertyVectors;
+        for (const column of this.propertyVectors) initializePropertyDictionary(column);
         this.name = featureTable.name;
         this.extent = featureTable.extent;
         this.version = 2;
@@ -76,6 +78,20 @@ class MLTVectorTileLayer implements VectorTileLayerLike {
     feature(i: number): VectorTileFeatureLike {
         if (!Number.isInteger(i) || i < 0 || i >= this.length) throw new RangeError('MLT feature index out of bounds');
         return new MLTVectorTileFeature(this, i);
+    }
+}
+
+/**
+ * FSST columns retain decoded dictionary buffers on their first present value.
+ * Initialize those buffers before measuring a tile so later property reads cannot grow
+ * its cache entry. Empty or entirely null columns never allocate a decoded dictionary.
+ */
+function initializePropertyDictionary(column: FeatureTable['propertyVectors'][number]): void {
+    if (!(column instanceof StringFsstDictionaryVector)) return;
+    for (let index = 0; index < column.size; index++) {
+        if (!column.has(index)) continue;
+        column.getValue(index);
+        return;
     }
 }
 
