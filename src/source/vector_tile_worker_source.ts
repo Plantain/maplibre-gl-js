@@ -1,6 +1,6 @@
 import {PbfReader} from 'pbf';
 import {VectorTile} from '@mapbox/vector-tile';
-import {fromVectorTileJs, type VectorTileLayerLike, type VectorTileLike} from '@maplibre/vt-pbf';
+import {fromVectorTileJs, type VectorTileLike} from '@maplibre/vt-pbf';
 import {type ExpiryData, getArrayBuffer} from '../util/ajax.ts';
 import {WorkerTile} from './worker_tile.ts';
 import {WorkerTileState} from './worker_tile_state.ts';
@@ -18,7 +18,6 @@ import type {
     TileEncoding
 } from '../source/worker_source.ts';
 import type {IActor} from '../util/actor.ts';
-import type {StyleLayer} from '../style/style_layer.ts';
 import type {StyleLayerIndex} from '../style/style_layer_index.ts';
 
 export type LoadVectorTileResult = {
@@ -224,13 +223,14 @@ export class VectorTileWorkerSource implements WorkerSource {
     }
 
     /**
-     * If we are seeking a tile deeper than the source's max available canonical tile, get the overzoomed tile
+     * Slices a tile deeper than the source's maximum canonical zoom and caches the result.
+     * Retains every source layer so cached tiles can be reparsed after style layers are added or made visible.
      * @param params - the worker tile parameters
      * @param maxZoomVectorTile - the original vector tile at the source's max available canonical zoom
      * @returns the overzoomed tile and its raw data
      */
     private _getOverzoomTile(params: WorkerTileParameters, maxZoomVectorTile: VectorTileLike): LoadVectorTileResult {
-        const {tileID, source, overzoomParameters} = params;
+        const {tileID, overzoomParameters} = params;
         const {maxZoomTileID} = overzoomParameters;
 
         const cacheKey = `${maxZoomTileID.key}_${tileID.key}_${params.request?.url}`;
@@ -241,14 +241,7 @@ export class VectorTileWorkerSource implements WorkerSource {
         }
 
         const overzoomedVectorTile = new VectorTileOverzoomed();
-        const layerFamilies: Record<string, StyleLayer[][]> = this.layerIndex.familiesBySource[source];
-
-        for (const sourceLayerId in layerFamilies) {
-            const sourceLayer: VectorTileLayerLike = maxZoomVectorTile.layers[sourceLayerId];
-            if (!sourceLayer) {
-                continue;
-            }
-
+        for (const sourceLayer of Object.values(maxZoomVectorTile.layers)) {
             const slicedTileLayer = sliceVectorTileLayer(sourceLayer, maxZoomTileID, tileID.canonical);
             if (slicedTileLayer.length > 0) {
                 overzoomedVectorTile.addLayer(slicedTileLayer);

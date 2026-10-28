@@ -12,7 +12,10 @@ import {SubdivisionGranularitySetting} from '../render/subdivision_granularity_s
 import {OverscaledTileID, CanonicalTileID} from '../tile/tile_id.ts';
 import {VectorTile} from '@mapbox/vector-tile';
 import Point from '@mapbox/point-geometry';
+import {encodeTile} from '@maplibre/mlt';
+import {RGBAImage} from '../util/image.ts';
 
+import type {SymbolLayerSpecification} from '@maplibre/maplibre-gl-style-spec';
 import type {TileParameters, WorkerTileParameters, WorkerTileResult, WorkerTileWithData} from './worker_source.ts';
 import type {IActor} from '../util/actor.ts';
 
@@ -28,7 +31,7 @@ describe('vector tile worker source', () => {
 
     afterEach(() => {
         server.restore();
-        vi.clearAllMocks();
+        vi.restoreAllMocks();
     });
     test('VectorTileWorkerSource.abortTile aborts pending request', async () => {
         const source = new VectorTileWorkerSource(actor, new StyleLayerIndex(), []);
@@ -413,7 +416,7 @@ describe('vector tile worker source', () => {
     });
 
     test('VectorTileWorkerSource loadTile uses _getOverzoomTile when overzoomParameters is provided', async () => {
-        const source = new VectorTileWorkerSource({} as any, new StyleLayerIndex(), []);
+        const source = new VectorTileWorkerSource({} as any, new StyleLayerIndex([]), []);
         const mockVectorTile = {layers: {}} as any;
 
         source.loadVectorTile = vi.fn().mockReturnValue({
@@ -448,7 +451,7 @@ describe('vector tile worker source', () => {
     });
 
     test('VectorTileWorkerSource uses mvt encoding for overzoomed mlt tiles', async () => {
-        const source = new VectorTileWorkerSource(actor, new StyleLayerIndex(), []);
+        const source = new VectorTileWorkerSource(actor, new StyleLayerIndex([]), []);
         const mockVectorTile = {layers: {}} as any;
 
         source.loadVectorTile = vi.fn().mockReturnValue({
@@ -481,6 +484,60 @@ describe('vector tile worker source', () => {
         const res = await promise as WorkerTileWithData;
 
         expect(res.encoding).toBe('mvt');
+    });
+
+    test('overzoomed tiles retain hidden symbols for visibility changes and cached loads', async () => {
+        const rawData = Uint8Array.from(encodeTile([
+            {name: 'forecast', extent: 4096, features: [{
+                geometry: {type: 'Polygon', coordinates: [[[0, 0], [512, 0], [512, 512], [0, 512], [0, 0]]]}
+            }]},
+            {name: 'rain', extent: 4096, features: [{
+                geometry: {type: 'Point', coordinates: [256, 256]}
+            }]}
+        ])).buffer;
+        server.respondWith(request => {
+            request.respond(200, {'Content-Type': 'application/vnd.maplibre-tile'}, rawData as any);
+        });
+        const symbols: SymbolLayerSpecification = {
+            id: 'rain-icons', type: 'symbol', source: 'forecast', 'source-layer': 'rain',
+            layout: {'icon-image': 'rain', visibility: 'none'}
+        };
+        const layerIndex = new StyleLayerIndex([
+            {id: 'color', type: 'fill', source: 'forecast', 'source-layer': 'forecast'},
+            symbols
+        ]);
+        const imageActor = createFakeActor();
+        imageActor.sendAsync.mockResolvedValue({
+            rain: {data: new RGBAImage({width: 2, height: 2}), pixelRatio: 1, sdf: false, version: 0}
+        });
+        const source = new VectorTileWorkerSource(imageActor, layerIndex, ['rain']);
+        const params = {
+            uid: 'preloaded', source: 'forecast', encoding: 'mlt',
+            tileID: new OverscaledTileID(8, 0, 8, 176, 96),
+            zoom: 8, tileSize: 512, pixelRatio: 1,
+            request: {url: 'http://localhost:2900/forecast/8/176/96'},
+            overzoomParameters: {
+                maxZoomTileID: new CanonicalTileID(5, 22, 12),
+                overzoomRequest: {url: 'http://localhost:2900/forecast/5/22/12'}
+            },
+            subdivisionGranularity: SubdivisionGranularitySetting.noSubdivision
+        } as WorkerTileParameters;
+
+        const preload = source.loadTile(params);
+        server.respond();
+        const hidden = await preload as WorkerTileWithData;
+        expect(hidden.buckets.map(bucket => bucket.layerIds)).toEqual([['color']]);
+
+        layerIndex.update([{...symbols, layout: {...symbols.layout, visibility: 'visible'}}], []);
+        const shown = await source.reloadTile(params) as WorkerTileWithData;
+        expect(shown.buckets.map(bucket => bucket.layerIds)).toEqual([['color'], ['rain-icons']]);
+
+        const cachedLoad = source.loadTile({...params, uid: 'cached'});
+        server.respond();
+        const cached = await cachedLoad as WorkerTileWithData;
+        expect(cached.buckets.map(bucket => bucket.layerIds)).toEqual([['color'], ['rain-icons']]);
+        const queryTile = new VectorTile(new PbfReader(cached.rawTileData));
+        expect(queryTile.layers.rain).toHaveLength(1);
     });
 
     test('VectorTileWorkerSource.reloadTile does not reparse tiles with no vectorTile data but does call callback', async () => {
