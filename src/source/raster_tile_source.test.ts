@@ -10,7 +10,7 @@ import {Context} from '../webgl/context.ts';
 import {createNullGL} from '../util/test/null_gl.ts';
 
 import type {Dispatcher} from '../util/dispatcher.ts';
-import type {Tile} from '../tile/tile.ts';
+import {Tile} from '../tile/tile.ts';
 import type {MapSourceDataEvent} from '../ui/events.ts';
 
 function createSource(options, transformCallback?) {
@@ -498,6 +498,67 @@ describe('RasterTileSource', () => {
         expect(gl.texStorage2D).toHaveBeenCalledWith(gl.TEXTURE_2D, useMipmaps ? 9 : 1, gl.RGBA8, 256, 256);
         expect(gl.generateMipmap).toHaveBeenCalledTimes(useMipmaps ? 1 : 0);
         expect(gl.texParameteri).toHaveBeenCalledWith(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, useMipmaps ? gl.LINEAR_MIPMAP_NEAREST : gl.LINEAR);
+    });
+
+    test('reuses the owned raster texture on reload and releases its storage on resize', async () => {
+        const source = createSource({tiles: ['http://example.com/{z}/{x}/{y}.png']});
+        await waitForEvent(source, 'data', (e: MapSourceDataEvent) => e.sourceDataType === 'metadata');
+        let width = 512;
+        stubAjaxGetImage(vi.fn().mockImplementation(async () => {
+            const image = new ImageBitmap();
+            Object.defineProperties(image, {width: {value: width}, height: {value: 512}});
+            return image;
+        }));
+        server.respondWith('http://example.com/4/1/4.png', [200, {'Content-Type': 'image/png'}, 'image bytes']);
+        const gl = createNullGL();
+        const getTileTexture = vi.fn(() => null);
+        source.map.painter = {context: new Context(gl), getTileTexture} as any;
+        const tile = new Tile(new OverscaledTileID(4, 0, 4, 1, 4), 512);
+        for (let i = 0; i < 10; i++) {
+            const loaded = source.loadTile(tile);
+            await sleep(0);
+            server.respond();
+            await loaded;
+        }
+        expect(gl.createTexture).toHaveBeenCalledTimes(1);
+        expect(gl.texStorage2D).toHaveBeenCalledTimes(1);
+        expect(gl.texSubImage2D).toHaveBeenCalledTimes(10);
+        expect(getTileTexture).toHaveBeenCalledTimes(1);
+        const texture = tile.texture;
+        const handle = texture.texture;
+        width = 256;
+        const resized = source.loadTile(tile);
+        await sleep(0);
+        server.respond();
+        await resized;
+        expect(tile.texture).toBe(texture);
+        expect(gl.deleteTexture).toHaveBeenCalledWith(handle);
+        expect(gl.createTexture).toHaveBeenCalledTimes(2);
+        expect(tile.texture.size).toEqual([256, 512]);
+        expect(tile.state).toBe('loaded');
+    });
+
+    test('a response without expiry headers clears the previous reload deadline', async () => {
+        const source = createSource({tiles: ['http://example.com/{z}/{x}/{y}.png']});
+        await waitForEvent(source, 'data', (e: MapSourceDataEvent) => e.sourceDataType === 'metadata');
+        stubAjaxGetImage(undefined);
+        source.map.painter = {context: {}, getTileTexture: () => ({update() {}})} as any;
+        source.map._refreshExpiredTiles = true;
+        const tile = new Tile(new OverscaledTileID(4, 0, 4, 1, 4), 512);
+        const first = source.loadTile(tile);
+        await sleep(0);
+        server.requests.at(-1).respond(200, {'Cache-Control': 'max-age=1'}, 'image');
+        await first;
+        expect(tile.getExpiryTimeout()).toBeGreaterThan(0);
+        const now = Date.now();
+        vi.spyOn(Date, 'now').mockReturnValue(now + 2000);
+        const refreshed = source.loadTile(tile);
+        await sleep(0);
+        server.requests.at(-1).respond(200, {}, 'cached image');
+        await refreshed;
+        expect(tile.getExpiryTimeout()).toBeUndefined();
+        expect(tile.expiredRequestCount).toBe(0);
+        expect(tile.state).toBe('loaded');
     });
 
     test.each(['cancelled', 'upload failed'])('releases a decoded bitmap when tile loading is %s', async (outcome) => {

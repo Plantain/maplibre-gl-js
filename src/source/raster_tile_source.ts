@@ -275,6 +275,10 @@ export class RasterTileSource extends Evented<SourceEventType> implements Source
         return this._requestDependencies.some(id => !this.map.getSource(id) || !this.map.isSourceLoaded(id));
     }
 
+    /**
+     * Replaces a tile's pixels in its owned texture. A response without expiry
+     * headers clears the previous response's deadline, including protocol cache hits.
+     */
     async loadTile(tile: Tile): Promise<void> {
         const url = tile.tileID.canonical.url(this.tiles, this.map.getPixelRatio(), this.scheme, this.map.style.projection.worldCoordinateHelper.tileMatrixSet);
         const premultiply = this._premultiplyAlpha;
@@ -301,6 +305,9 @@ export class RasterTileSource extends Evented<SourceEventType> implements Source
             if (response) {
                 if (this.map._refreshExpiredTiles && (response.cacheControl || response.expires)) {
                     tile.setExpiryData({cacheControl: response.cacheControl, expires: response.expires});
+                } else {
+                    tile.expirationTime = null;
+                    tile.expiredRequestCount = 0;
                 }
                 const context = this.map.painter.context;
                 const gl = context.gl;
@@ -308,7 +315,7 @@ export class RasterTileSource extends Evented<SourceEventType> implements Source
                 // it is drawn as fully transparent, which keeps it distinct from a missing
                 // tile (404), where the parent tile shows through instead.
                 const img = response.data ?? new RGBAImage({width: 1, height: 1}, new Uint8Array(4));
-                tile.texture = this.map.painter.getTileTexture(img.width);
+                tile.texture ??= this.map.painter.getTileTexture(img.width);
                 if (tile.texture) {
                     tile.texture.update(img, {useMipmap, premultiply});
                 } else {
