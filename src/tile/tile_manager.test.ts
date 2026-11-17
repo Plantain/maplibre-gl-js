@@ -347,6 +347,48 @@ describe('TileManager.removeTile', () => {
 
     });
 
+    test('aborts an in-flight expiry refresh before unloading the evicted tile', async () => {
+        const tileID = new OverscaledTileID(0, 0, 0, 0, 0);
+        const calls: string[] = [];
+        const tileManager = createTileManager();
+        let releaseRefresh: () => void;
+        const refreshReleased = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+        let requests = 0;
+        tileManager._source.loadTile = async (tile) => {
+            // The first load succeeds; the refresh stays in flight until released.
+            if (requests++ > 0) {
+                await refreshReleased;
+                return;
+            }
+            tile.state = 'loaded';
+            tile.expirationTime = Date.now() - 1000;
+        };
+        tileManager._source.abortTile = async () => { calls.push('abort'); };
+        tileManager._source.unloadTile = async () => { calls.push('unload'); };
+
+        const tr = createMercatorTransform();
+        tr.resize(512, 512);
+        tileManager.updateCacheSize(tr);
+
+        const tile = tileManager._addTile(tileID);
+        await sleep(0);
+        tileManager._reloadTile(tileID.key, 'expired');
+        expect(tile.state).toBe('expired');
+
+        // Leaves the view mid-refresh: cached, then evicted because it is already expired.
+        tileManager._removeTile(tileID.key);
+        await sleep(5);
+
+        expect(calls).toEqual(['abort', 'unload']);
+        expect(tile.aborted).toBe(true);
+
+        // The aborted refresh settling must not schedule a reload under the old id.
+        releaseRefresh();
+        await sleep(0);
+        expect(tileManager._timers[tileID.key]).toBeUndefined();
+        expect(requests).toBe(2);
+    });
+
     test('_tileLoaded after _removeTile skips tile.added', async () => {
         const tileID = new OverscaledTileID(0, 0, 0, 0, 0);
 

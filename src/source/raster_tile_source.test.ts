@@ -561,6 +561,61 @@ describe('RasterTileSource', () => {
         expect(tile.state).toBe('loaded');
     });
 
+    test('a response landing after unload does not write into the pooled texture', async () => {
+        const images: ImageBitmap[] = [];
+        stubAjaxGetImage(vi.fn().mockImplementation(async () => {
+            const image = new ImageBitmap();
+            Object.defineProperties(image, {width: {value: 257}, height: {value: 258}});
+            images.push(image);
+            return image;
+        }));
+        const gl = createNullGL();
+        const pool = [];
+        const painter = {
+            context: new Context(gl),
+            getTileTexture: () => pool.pop() ?? null,
+            saveTileTexture: (texture) => pool.push(texture)
+        } as any;
+        const source = createSource({tiles: ['http://example.com/{z}/{x}/{y}.webp']});
+        await waitForEvent(source, 'data', (e: MapSourceDataEvent) => e.sourceDataType === 'metadata');
+        source.map.painter = painter;
+        const lastUpload = () => vi.mocked(gl.texSubImage2D).mock.calls.at(-1).at(-1);
+
+        const stale = new Tile(new OverscaledTileID(4, 0, 4, 1, 4), 512);
+        const first = source.loadTile(stale);
+        await sleep(0);
+        server.requests.at(-1).respond(200, {}, 'image');
+        await first;
+        const texture = stale.texture;
+
+        // A refresh is in flight when the tile is unloaded without being aborted.
+        const refresh = source.loadTile(stale);
+        await sleep(0);
+        const refreshRequest = server.requests.at(-1);
+        await source.unloadTile(stale);
+        expect(pool).toEqual([texture]);
+        expect(stale.texture).toBeNull();
+
+        // Another tile is handed the pooled texture.
+        const current = new Tile(new OverscaledTileID(4, 0, 4, 2, 4), 512);
+        const loaded = source.loadTile(current);
+        await sleep(0);
+        server.requests.at(-1).respond(200, {}, 'image');
+        await loaded;
+        expect(current.texture).toBe(texture);
+        const currentImage = images.at(-1);
+        expect(lastUpload()).toBe(currentImage);
+        const update = vi.spyOn(texture, 'update');
+
+        refreshRequest.respond(200, {}, 'late image');
+        await refresh;
+        // The late image went to a new texture, not into the one `current` owns.
+        expect(update).not.toHaveBeenCalled();
+        expect(current.texture).toBe(texture);
+        expect(stale.texture).not.toBe(texture);
+        expect(gl.createTexture).toHaveBeenCalledTimes(2);
+    });
+
     test.each(['cancelled', 'upload failed'])('releases a decoded bitmap when tile loading is %s', async (outcome) => {
         const source = createSource({tiles: ['http://example.com/{z}/{x}/{y}.png']});
         await waitForEvent(source, 'data', (e: MapSourceDataEvent) => e.sourceDataType === 'metadata');

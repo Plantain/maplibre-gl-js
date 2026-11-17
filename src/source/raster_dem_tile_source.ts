@@ -158,7 +158,10 @@ export class RasterDEMTileSource extends RasterTileSource implements Source {
     }
 
     async unloadTile(tile: Tile): Promise<void> {
-        if (tile.demTexture) this.map.painter.saveTileTexture(tile.demTexture);
+        if (tile.demTexture) {
+            this.map.painter.saveTileTexture(tile.demTexture);
+            tile.demTexture = null;
+        }
         if (tile.fbo) {
             tile.fbo.destroy();
             delete tile.fbo;

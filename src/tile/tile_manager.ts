@@ -120,7 +120,7 @@ export class TileManager extends Evented<SourceEventType> {
         this._source = createSource(id, options, dispatcher, this);
 
         this._inViewTiles = new InViewTiles();
-        this._outOfViewCache = new TileCache(0, (tile) => this._unloadTile(tile));
+        this._outOfViewCache = new TileCache(0, (tile) => this._evictTile(tile));
         this._timers = {};
         this._maxTileCacheSize = null;
         this._maxTileCacheZoomLevels = null;
@@ -211,6 +211,19 @@ export class TileManager extends Evented<SourceEventType> {
     _unloadTile(tile: Tile): void {
         if (this._source.unloadTile)
             this._source.unloadTile(tile);
+    }
+
+    /**
+     * Unloads a tile dropped from the out-of-view cache. A tile can be cached while
+     * its expiry refresh is still in flight; that request is aborted first so its
+     * response cannot touch resources the unload hands back for reuse.
+     */
+    _evictTile(tile: Tile): void {
+        if (tile.state === 'expired' || tile.state === 'reloading') {
+            tile.aborted = true;
+            this._abortTile(tile);
+        }
+        this._unloadTile(tile);
     }
 
     _abortTile(tile: Tile): void {
@@ -317,7 +330,9 @@ export class TileManager extends Evented<SourceEventType> {
         }
 
         if (previousState === 'expired') tile.refreshedUponExpiration = true;
-        this._setTileReloadTimer(id, tile);
+        // An aborted tile has left the pyramid; a timer under its id would reload
+        // whichever tile holds that id next.
+        if (!tile.aborted) this._setTileReloadTimer(id, tile);
 
         if (result?.unmodified) return;
 

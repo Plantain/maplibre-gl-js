@@ -347,6 +347,9 @@ export class RasterTileSource extends Evented<SourceEventType> implements Source
     async unloadTile(tile: Tile): Promise<void> {
         if (tile.texture) {
             this.map.painter.saveTileTexture(tile.texture);
+            // The pool owns the texture now. A response that lands after the unload
+            // must not write into it: another tile may already have been handed it.
+            tile.texture = null;
         }
     }
 
